@@ -22,6 +22,8 @@ type Vault struct {
 	fwd   map[string]string // secret -> placeholder
 	mask  []pair            // secret -> ph, triés par longueur décroissante
 	rehy  []pair            // ph (et variantes base64) -> secret
+	maskM *matcher          // index immuable reconstruit à chaque ajout
+	rehyM *matcher
 	allow map[string]struct{}
 	maxPh int
 
@@ -80,6 +82,7 @@ func (v *Vault) register(kind, pfx, secret string) {
 	// Variante base64 : si le modèle encode le placeholder seul.
 	enc := base64.StdEncoding
 	v.rehy = append(v.rehy, pair{[]byte(enc.EncodeToString([]byte(ph))), []byte(enc.EncodeToString([]byte(secret)))})
+	v.maskM, v.rehyM = newMatcher(v.mask), newMatcher(v.rehy)
 	if len(ph) > v.maxPh {
 		v.maxPh = len(ph)
 	}
@@ -100,19 +103,23 @@ func (v *Vault) Mask(b []byte) ([]byte, int) {
 	scan(b, func(s span) { spans = append(spans, s) })
 	v.mu.Lock()
 	for _, s := range spans {
+		// m[string(bytes)] n'alloue pas : les secrets déjà connus ne coûtent rien
+		if _, known := v.fwd[string(b[s.s:s.e])]; known {
+			continue
+		}
 		v.register(s.kind, s.pfx, string(b[s.s:s.e]))
 	}
-	mask := v.mask
+	m := v.maskM
 	v.mu.Unlock()
-	return replaceAll(b, mask)
+	return m.replace(b)
 }
 
 // Rehydrate remplace les placeholders par les vrais secrets.
 func (v *Vault) Rehydrate(b []byte) ([]byte, int) {
 	v.mu.RLock()
-	r := v.rehy
+	m := v.rehyM
 	v.mu.RUnlock()
-	return replaceAll(b, r)
+	return m.replace(b)
 }
 
 // Holdback : nombre d'octets de fin de s qui pourraient être le début d'un
@@ -144,6 +151,7 @@ func (v *Vault) Allow(secret string) {
 	for i, p := range v.mask {
 		if string(p.from) == secret {
 			v.mask = append(v.mask[:i:i], v.mask[i+1:]...) // copie : Mask en cours garde l'ancienne slice
+			v.maskM = newMatcher(v.mask)
 			break
 		}
 	}
@@ -160,29 +168,4 @@ func (v *Vault) HasSecrets() bool {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	return len(v.mask) > 0
-}
-
-// replaceAll applique toutes les paires en une passe par paire ; n'alloue
-// que si au moins un remplacement a lieu.
-func replaceAll(b []byte, ps []pair) ([]byte, int) {
-	total := 0
-	for _, p := range ps {
-		if len(p.from) == 0 || !bytes.Contains(b, p.from) {
-			continue
-		}
-		c := bytes.Count(b, p.from)
-		out := make([]byte, 0, len(b)+c*(len(p.to)-len(p.from)))
-		for {
-			i := bytes.Index(b, p.from)
-			if i < 0 {
-				break
-			}
-			out = append(out, b[:i]...)
-			out = append(out, p.to...)
-			b = b[i+len(p.from):]
-		}
-		b = append(out, b...)
-		total += c
-	}
-	return b, total
 }

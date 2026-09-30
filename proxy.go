@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
@@ -113,64 +112,4 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write(out)
 	}
 	p.emit(Event{Kind: evReq, Method: r.Method, Path: r.URL.Path, Status: resp.StatusCode, Masked: masked, Rehyd: rehyd, Dur: time.Since(t0), Prov: prov})
-}
-
-// injectHint ajoute une consigne constante. Constante => le préfixe reste
-// identique d'un tour à l'autre, le prompt caching tient.
-func injectHint(body []byte, path string) []byte {
-	var m map[string]json.RawMessage
-	if json.Unmarshal(body, &m) != nil {
-		return body
-	}
-	switch {
-	case strings.HasSuffix(path, "/messages"):
-		m["system"] = appendHint(m["system"])
-	case strings.HasSuffix(path, "/responses"):
-		m["instructions"] = appendHint(m["instructions"])
-	case strings.Contains(path, ":generateContent") || strings.Contains(path, ":streamGenerateContent"):
-		// Gemini natif : systemInstruction.parts[] (ou system_instruction)
-		k := "systemInstruction"
-		if _, ok := m["system_instruction"]; ok {
-			k = "system_instruction"
-		}
-		var si struct {
-			Parts []json.RawMessage `json:"parts"`
-		}
-		json.Unmarshal(m[k], &si)
-		b, _ := json.Marshal(map[string]string{"text": hint})
-		si.Parts = append(si.Parts, b)
-		m[k], _ = json.Marshal(si)
-	case strings.HasSuffix(path, "/chat/completions"):
-		var msgs []json.RawMessage
-		if json.Unmarshal(m["messages"], &msgs) != nil {
-			return body
-		}
-		sys, _ := json.Marshal(map[string]string{"role": "system", "content": hint})
-		m["messages"], _ = json.Marshal(append([]json.RawMessage{sys}, msgs...))
-	default:
-		return body
-	}
-	out, err := json.Marshal(m)
-	if err != nil {
-		return body
-	}
-	return out
-}
-
-// appendHint gère un champ absent, string, ou tableau de blocs texte.
-func appendHint(sys json.RawMessage) json.RawMessage {
-	switch {
-	case len(sys) == 0 || string(sys) == "null":
-		sys, _ = json.Marshal(hint)
-	case sys[0] == '"':
-		var s string
-		json.Unmarshal(sys, &s)
-		sys, _ = json.Marshal(s + "\n\n" + hint)
-	case sys[0] == '[':
-		var blocks []json.RawMessage
-		json.Unmarshal(sys, &blocks)
-		b, _ := json.Marshal(map[string]string{"type": "text", "text": hint})
-		sys, _ = json.Marshal(append(blocks, b))
-	}
-	return sys
 }

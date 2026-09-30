@@ -298,3 +298,41 @@ func TestGeminiHint(t *testing.T) {
 		t.Fatalf("%s", out)
 	}
 }
+
+// La consigne doit produire du JSON valide et identique à l'ancienne méthode
+// (décodage complet), sur toutes les formes de champ.
+func TestHintShapes(t *testing.T) {
+	cases := []struct{ path, in, want string }{
+		{"/v1/messages", `{"model":"m","messages":[]}`, `system`},
+		{"/v1/messages", `{"system":"be nice","messages":[]}`, `be nice\n\n`},
+		{"/v1/messages", `{"system":[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}}],"messages":[]}`, `"cache_control"`},
+		{"/v1/messages", `{"system":[],"messages":[]}`, `[{"type":"text"`},
+		{"/v1/messages", `{"system":null}`, `"system":"Values`},
+		{"/v1/messages", `{}`, `{"system":"Values`},
+		{"/v1/messages", " {\n \"messages\" : [ {\"content\":\"a \\\"system\\\": x\"} ] ,\n \"system\" : \"s\" }", `s\n\n`},
+		{"/v1/responses", `{"input":"hi"}`, `"instructions"`},
+		{"/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}]}`, `[{"role":"system"`},
+		{"/v1/chat/completions", `{"messages":[]}`, `[{"role":"system","content":"Values matching *REDACTED_* are masked secrets. Always copy them verbatim, character for character: never encode, split, re-case or alter them."}]`},
+		{"/v1beta/models/g:generateContent", `{"contents":[]}`, `"systemInstruction":{"parts":[{"text"`},
+		{"/v1beta/models/g:generateContent", `{"system_instruction":{"parts":[{"text":"x"}]}}`, `{"text":"x"},{"text"`},
+		{"/v1beta/models/g:generateContent", `{"systemInstruction":{"role":"user"}}`, `"parts":[{"text"`},
+	}
+	for _, c := range cases {
+		out := injectHint([]byte(c.in), c.path)
+		if !json.Valid(out) {
+			t.Errorf("%s: JSON invalide: %s", c.in, out)
+		}
+		if !strings.Contains(string(out), c.want) || !strings.Contains(string(out), "REDACTED_") {
+			t.Errorf("%s:\n got %s\nwant %s", c.in, out, c.want)
+		}
+	}
+}
+
+func BenchmarkHint64KB(b *testing.B) {
+	body := convo(64<<10, 0)
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	for b.Loop() {
+		injectHint(body, "/v1/messages")
+	}
+}
