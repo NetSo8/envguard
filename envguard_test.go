@@ -336,3 +336,69 @@ func BenchmarkHint64KB(b *testing.B) {
 		injectHint(body, "/v1/messages")
 	}
 }
+
+// Types de test pour construire / relire des flux Anthropic.
+type delta struct {
+	Type        string `json:"type"`
+	Text        string `json:"text,omitempty"`
+	PartialJSON string `json:"partial_json,omitempty"`
+	Thinking    string `json:"thinking,omitempty"`
+}
+
+type deltaEvent struct {
+	Type  string `json:"type"`
+	Index int    `json:"index"`
+	Delta delta  `json:"delta"`
+}
+
+func (d *delta) field() *string {
+	switch d.Type {
+	case "text_delta":
+		return &d.Text
+	case "input_json_delta":
+		return &d.PartialJSON
+	case "thinking_delta":
+		return &d.Thinking
+	}
+	return nil
+}
+
+// Échappements JSON : \n, \", \\, unicode, emoji (paire surrogate), HTML.
+func TestSSEEscapes(t *testing.T) {
+	v := NewVault("")
+	v.Mask([]byte(key))
+	ph := placeholder("sk-ant-", key)
+	full := "ligne 1\nquote \" back\\slash <b>&</b> é 😀 tab\t " + ph + "\n"
+	want := strings.Replace(full, ph, key, 1)
+	for _, esc := range []bool{false, true} {
+		var src bytes.Buffer
+		for _, part := range []string{full[:20], full[20:47], full[47:]} {
+			js, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": part}}}})
+			if esc { // forme \uXXXX comme certains fournisseurs
+				js = bytes.ReplaceAll(js, []byte("😀"), []byte(`\ud83d\ude00`))
+				js = bytes.ReplaceAll(js, []byte("é"), []byte(`\u00e9`))
+			}
+			src.WriteString("data: " + string(js) + "\n\n")
+		}
+		src.WriteString("data: [DONE]\n\n")
+		var out bytes.Buffer
+		(&sseRewriter{v: v, w: &out}).run(&src)
+		var got strings.Builder
+		for _, l := range strings.Split(out.String(), "\n") {
+			d, ok := strings.CutPrefix(l, "data: ")
+			if !ok || d == "[DONE]" {
+				continue
+			}
+			var c struct {
+				Choices []struct{ Delta struct{ Content string } }
+			}
+			if err := json.Unmarshal([]byte(d), &c); err != nil {
+				t.Fatal(err, d)
+			}
+			got.WriteString(c.Choices[0].Delta.Content)
+		}
+		if got.String() != want {
+			t.Fatalf("esc=%v:\n got %q\nwant %q", esc, got.String(), want)
+		}
+	}
+}

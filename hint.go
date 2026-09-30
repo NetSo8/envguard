@@ -169,7 +169,7 @@ func skipValue(b []byte, i int) int {
 		}
 		return len(b)
 	}
-	for i < len(b) && b[i] != ',' && b[i] != '}' && b[i] != ']' && b[i] != ' ' && b[i] != '\n' {
+	for i < len(b) && b[i] != ',' && b[i] != '}' && b[i] != ']' && b[i] != ' ' && b[i] != '\n' && b[i] != '\r' && b[i] != '\t' {
 		i++
 	}
 	return i

@@ -3,28 +3,53 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"io"
 	"net/http"
-	"strconv"
-	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
-// Réécriture des flux SSE : Anthropic Messages, OpenAI Chat Completions et
-// OpenAI Responses.
+// Réécriture des flux SSE : Anthropic Messages, OpenAI Chat Completions,
+// OpenAI Responses et Gemini natif.
 //
 // Un placeholder peut être coupé entre deux events (ex: "sk-ant-RED" puis
 // "ACTED_7f3a…"). Chaque flux de texte (content block, choice, tool call,
-// output item…) a son « slot » : on y retient la fin qui ressemble au début
-// d'un placeholder, on la recolle au fragment suivant, et on vide le slot à
-// la fin du bloc. Les arguments de tool calls sont ainsi réhydratés avant
-// que le client n'exécute l'outil.
+// output item, candidate…) a son « slot » : on y retient la fin qui ressemble
+// au début d'un placeholder, on la recolle au fragment suivant, et on vide le
+// slot à la fin du bloc. Les arguments de tool calls sont ainsi réhydratés
+// avant que le client n'exécute l'outil.
+//
+// Aucun décodage JSON : le mini-scanner (hint.go) localise les strings de
+// texte dans les octets de l'event, seules ces strings sont décodées (dans le
+// buffer du slot) puis ré-encodées en place. Tout le reste de l'event est
+// recopié tel quel. Les events de vidage sont préconstruits une fois par slot.
+
+const (
+	kAnth uint8 = iota + 1
+	kChat
+	kChatTool
+	kResp
+	kGem
+)
+
+// skey identifie un flux de texte sans allouer de string.
+type skey struct {
+	kind, f uint8
+	a, b    int32
+}
 
 type slot struct {
-	used  bool
-	key   string
-	buf   []byte
-	synth func(text string) []byte // event SSE complet pour vider le reliquat
+	used bool
+	k    skey
+	buf  []byte // texte en attente, décodé
+	pre  []byte // event synthétique jusqu'à la valeur de la string
+	suf  []byte // après la valeur, "\n\n" compris
+}
+
+type edit struct {
+	vs, ve int
+	s      *slot
+	final  bool
 }
 
 type sseRewriter struct {
@@ -32,7 +57,11 @@ type sseRewriter struct {
 	w     io.Writer
 	fl    http.Flusher
 	slots [32]slot // tableau fixe, recherche linéaire : plus rapide qu'une map à cette taille
-	count int      // nb de réhydratations
+	edits [32]edit // strings à réécrire dans l'event courant
+	ne    int
+	out   []byte // buffers réutilisés d'un event à l'autre
+	tmp   []byte
+	count int // nb de réhydratations
 }
 
 var (
@@ -44,6 +73,8 @@ var (
 	pChoices   = []byte(`"choices"`)
 	pRespType  = []byte(`"type":"response.`)
 	pCands     = []byte(`"candidates"`)
+	sDelta     = []byte(".delta")
+	sDone      = []byte(".done")
 )
 
 func (r *sseRewriter) run(src io.Reader) error {
@@ -67,7 +98,7 @@ func (r *sseRewriter) run(src io.Reader) error {
 			if len(bytes.TrimSpace(ev)) > 0 {
 				r.event(ev)
 			}
-			r.flushPrefix("")
+			r.flush(0, -1)
 			if err == io.EOF {
 				return nil
 			}
@@ -76,397 +107,632 @@ func (r *sseRewriter) run(src io.Reader) error {
 	}
 }
 
-func dataOf(ev []byte) []byte {
+// dataSpan renvoie les bornes de la valeur de la ligne "data: ".
+func dataSpan(ev []byte) (int, int) {
 	i := bytes.Index(ev, pData)
 	if i < 0 {
-		return nil
+		return -1, -1
 	}
-	d := ev[i+len(pData):]
-	if j := bytes.IndexByte(d, '\n'); j >= 0 {
-		d = d[:j]
+	s := i + len(pData)
+	e := s + bytes.IndexByte(ev[s:], '\n')
+	if e < s {
+		e = len(ev)
 	}
-	return bytes.TrimRight(d, "\r")
+	for e > s && ev[e-1] == '\r' {
+		e--
+	}
+	return s, e
 }
 
 func (r *sseRewriter) event(ev []byte) error {
-	data := dataOf(ev)
+	ds, de := dataSpan(ev)
 	// Chemin rapide : aucun secret connu => rien à réhydrater, on relaie tel quel.
-	if data == nil || !r.v.HasSecrets() {
+	if ds < 0 || !r.v.HasSecrets() {
 		return r.write(ev)
 	}
+	data := ev[ds:de]
+	r.ne = 0
+	handled := false
 	switch {
 	case bytes.Equal(data, pDone):
-		r.flushPrefix("")
+		r.flush(0, -1)
 		return r.write(ev)
 	case bytes.Contains(data, pAnthDelta):
-		if r.anthDelta(ev, data) {
-			return nil
-		}
+		handled = r.anthDelta(ev, ds)
 	case bytes.Contains(data, pAnthStop):
-		var s struct{ Index int }
-		json.Unmarshal(data, &s)
-		r.flushPrefix("a" + strconv.Itoa(s.Index) + ":")
+		if _, vs, ve, ok := field(ev, ds, "index"); ok {
+			r.flush(kAnth, atoi(ev[vs:ve]))
+		}
 	case bytes.Contains(data, pMsgStop):
-		r.flushPrefix("")
+		r.flush(0, -1)
 	case bytes.Contains(data, pRespType):
-		if r.responses(ev, data) {
-			return nil
-		}
+		handled = r.responses(ev, ds)
 	case bytes.Contains(data, pCands):
-		if r.gemini(ev, data) {
-			return nil
-		}
+		handled = r.gemini(ev, ds)
 	case bytes.Contains(data, pChoices):
-		if r.chat(ev, data) {
-			return nil
-		}
+		handled = r.chat(ev, ds)
+	}
+	if handled && r.ne > 0 {
+		return r.apply(ev)
 	}
 	out, n := r.v.Rehydrate(ev)
 	r.count += n
 	return r.write(out)
 }
 
+// apply recopie l'event en réécrivant les strings collectées (ordre du document).
+func (r *sseRewriter) apply(ev []byte) error {
+	out, last := r.out[:0], 0
+	for i := 0; i < r.ne; i++ {
+		e := &r.edits[i]
+		out = append(out, ev[last:e.vs]...)
+		out = r.feed(e.s, ev[e.vs+1:e.ve-1], e.final, out)
+		last = e.ve
+	}
+	out = append(out, ev[last:]...)
+	r.out = out
+	// Placeholders complets hors des strings de texte (functionCall, ids…).
+	if bytes.Contains(out, marker) {
+		reh, n := r.v.Rehydrate(out)
+		r.count += n
+		out = reh
+	}
+	return r.write(out)
+}
+
 // --- slots -------------------------------------------------------------
 
-func (r *sseRewriter) slot(key string) *slot {
+func (r *sseRewriter) slot(k skey) (*slot, bool) {
 	free := -1
 	for i := range r.slots {
 		s := &r.slots[i]
-		if s.used && s.key == key {
-			return s
+		if s.used && s.k == k {
+			return s, false
 		}
 		if !s.used && free < 0 {
 			free = i
 		}
 	}
 	if free < 0 {
-		return nil
+		return nil, false // plus de slots libres : pas de holdback pour ce flux
 	}
 	s := &r.slots[free]
-	s.used, s.key, s.buf = true, key, s.buf[:0]
-	return s
+	s.used, s.k = true, k
+	s.buf, s.pre, s.suf = s.buf[:0], s.pre[:0], s.suf[:0]
+	return s, true
 }
 
-// feed ajoute un fragment et renvoie le texte réhydraté émissible maintenant.
-// final=true : rien n'est retenu (fin du flux pour ce slot).
-func (r *sseRewriter) feed(key, frag string, final bool, synth func(string) []byte) string {
-	s := r.slot(key)
-	if s == nil { // plus de slots libres : pas de holdback, réhydratation simple
-		out, n := r.v.Rehydrate([]byte(frag))
-		r.count += n
-		return string(out)
+func (r *sseRewriter) addEdit(vs, ve int, s *slot, final bool) {
+	if r.ne < len(r.edits) {
+		r.edits[r.ne] = edit{vs, ve, s, final}
+		r.ne++
 	}
-	s.synth = synth
-	s.buf = append(s.buf, frag...)
+}
+
+// feed décode le fragment dans le buffer du slot, retient la fin qui pourrait
+// être un début de placeholder, et ajoute à out la string JSON émissible.
+func (r *sseRewriter) feed(s *slot, raw []byte, final bool, out []byte) []byte {
+	if s == nil {
+		r.tmp = appendUnescape(r.tmp[:0], raw)
+		reh, n := r.v.Rehydrate(r.tmp)
+		r.count += n
+		return appendJSONString(out, reh)
+	}
+	s.buf = appendUnescape(s.buf, raw)
 	keep := 0
 	if !final {
 		keep = r.v.Holdback(s.buf)
 	}
-	out, n := r.v.Rehydrate(s.buf[:len(s.buf)-keep])
+	reh, n := r.v.Rehydrate(s.buf[:len(s.buf)-keep])
 	r.count += n
-	str := string(out) // copie avant de décaler le buffer
+	out = appendJSONString(out, reh) // copie avant de décaler le buffer
 	s.buf = s.buf[:copy(s.buf, s.buf[len(s.buf)-keep:])]
 	if final {
 		s.used = false
 	}
-	return str
+	return out
 }
 
-func (r *sseRewriter) flushPrefix(prefix string) {
+func (r *sseRewriter) flushSlot(s *slot) {
+	s.used = false
+	if len(s.buf) == 0 {
+		return
+	}
+	reh, n := r.v.Rehydrate(s.buf)
+	r.count += n
+	t := append(r.tmp[:0], s.pre...)
+	t = appendJSONString(t, reh)
+	t = append(t, s.suf...)
+	r.tmp = t
+	r.write(t)
+}
+
+// flush vide les slots d'un type (0 = tous) et d'un index (-1 = tous).
+// Pour kChat, les tool calls du même choice sont inclus.
+func (r *sseRewriter) flush(kind uint8, a int32) {
 	for i := range r.slots {
 		s := &r.slots[i]
-		if !s.used || !strings.HasPrefix(s.key, prefix) {
+		if !s.used || a >= 0 && s.k.a != a {
 			continue
 		}
-		s.used = false
-		if len(s.buf) > 0 && s.synth != nil {
-			out, n := r.v.Rehydrate(s.buf)
-			r.count += n
-			r.write(s.synth(string(out)))
+		if kind == 0 || s.k.kind == kind || kind == kChat && s.k.kind == kChatTool {
+			r.flushSlot(s)
+		}
+	}
+}
+
+// flushExcept vide, avant l'event courant, les slots du flux a absents de cet event.
+func (r *sseRewriter) flushExcept(k1, k2 uint8, a int32, present []skey) {
+	for i := range r.slots {
+		s := &r.slots[i]
+		if !s.used || s.k.a != a || s.k.kind != k1 && s.k.kind != k2 {
+			continue
+		}
+		keep := false
+		for _, p := range present {
+			if p == s.k {
+				keep = true
+				break
+			}
+		}
+		if !keep {
+			r.flushSlot(s)
 		}
 	}
 }
 
 // --- Anthropic ---------------------------------------------------------
 
-type delta struct {
-	Type        string `json:"type"`
-	Text        string `json:"text,omitempty"`
-	PartialJSON string `json:"partial_json,omitempty"`
-	Thinking    string `json:"thinking,omitempty"`
-}
-
-type deltaEvent struct {
-	Type  string `json:"type"`
-	Index int    `json:"index"`
-	Delta delta  `json:"delta"`
-}
-
-func (d *delta) field() *string {
-	switch d.Type {
-	case "text_delta":
-		return &d.Text
-	case "input_json_delta":
-		return &d.PartialJSON
-	case "thinking_delta":
-		return &d.Thinking
-	}
-	return nil
-}
-
-func anthSynth(idx int, typ string) func(string) []byte {
-	return func(text string) []byte {
-		de := deltaEvent{Type: "content_block_delta", Index: idx, Delta: delta{Type: typ}}
-		*de.Delta.field() = text
-		js, _ := json.Marshal(de)
-		return sseBytes("content_block_delta", js)
-	}
-}
-
-func (r *sseRewriter) anthDelta(ev, data []byte) bool {
-	var de deltaEvent
-	if json.Unmarshal(data, &de) != nil {
+func (r *sseRewriter) anthDelta(ev []byte, ds int) bool {
+	_, is, ie, ok := field(ev, ds, "index")
+	if !ok {
 		return false
 	}
-	f := de.Delta.field()
-	if f == nil {
+	_, dv, _, ok := field(ev, ds, "delta")
+	if !ok || ev[dv] != '{' {
 		return false
 	}
-	*f = r.feed("a"+strconv.Itoa(de.Index)+":", *f, false, anthSynth(de.Index, de.Delta.Type))
-	if *f == "" {
-		return true // tout est retenu pour l'instant
+	_, ts, te, ok := field(ev, dv, "type")
+	if !ok {
+		return false
 	}
-	js, _ := json.Marshal(de)
-	r.write(sseBytes("content_block_delta", js))
+	var name string
+	var f uint8
+	switch string(ev[ts:te]) {
+	case `"text_delta"`:
+		name, f = "text", 1
+	case `"input_json_delta"`:
+		name, f = "partial_json", 2
+	case `"thinking_delta"`:
+		name, f = "thinking", 3
+	default:
+		return false
+	}
+	_, vs, ve, ok := field(ev, dv, name)
+	if !ok || ev[vs] != '"' {
+		return false
+	}
+	s, isNew := r.slot(skey{kAnth, f, atoi(ev[is:ie]), 0})
+	if isNew {
+		s.pre = append(s.pre, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":"...)
+		s.pre = append(s.pre, ev[is:ie]...)
+		s.pre = append(s.pre, `,"delta":{"type":`...)
+		s.pre = append(s.pre, ev[ts:te]...)
+		s.pre = append(s.pre, `,"`...)
+		s.pre = append(s.pre, name...)
+		s.pre = append(s.pre, `":`...)
+		s.suf = append(s.suf, "}}\n\n"...)
+	}
+	r.addEdit(vs, ve, s, false)
 	return true
 }
 
 // --- OpenAI Chat Completions --------------------------------------------
 
-var chatTextFields = [...]string{"content", "reasoning_content", "reasoning", "refusal"}
+var chatFields = [...]string{"content", "reasoning_content", "reasoning", "refusal"}
 
-func (r *sseRewriter) chat(ev, data []byte) bool {
-	m, ok := decode(data)
-	if !ok {
+func chatField(key []byte) uint8 {
+	for i, f := range chatFields {
+		if string(key) == f {
+			return uint8(i + 1)
+		}
+	}
+	return 0
+}
+
+var zero = []byte("0")
+
+func (r *sseRewriter) chat(ev []byte, ds int) bool {
+	_, cs, _, ok := field(ev, ds, "choices")
+	if !ok || ev[cs] != '[' {
 		return false
 	}
-	choices, _ := m["choices"].([]any)
-	base := map[string]any{"id": m["id"], "object": m["object"], "created": m["created"], "model": m["model"]}
-	for _, ci := range choices {
-		c, _ := ci.(map[string]any)
-		if c == nil {
-			continue
+	elems(ev, cs, func(c0, _ int) {
+		if ev[c0] != '{' {
+			return
 		}
-		idx := numStr(c["index"])
-		cp := "c" + idx + ":"
-		final := c["finish_reason"] != nil
-		d, _ := c["delta"].(map[string]any)
-		tcs, _ := d["tool_calls"].([]any)
-		if final { // vider d'abord les slots du choice absents de ce chunk
-			present := map[string]bool{}
-			for _, f := range chatTextFields {
-				if _, ok := d[f].(string); ok {
-					present[cp+f] = true
+		a, araw := int32(0), zero
+		if _, is, ie, ok := field(ev, c0, "index"); ok {
+			a, araw = atoi(ev[is:ie]), ev[is:ie]
+		}
+		final := false
+		if _, fs, _, ok := field(ev, c0, "finish_reason"); ok && ev[fs] != 'n' {
+			final = true
+		}
+		_, dv, _, ok := field(ev, c0, "delta")
+		if !ok || ev[dv] != '{' {
+			if final {
+				r.flush(kChat, a)
+			}
+			return
+		}
+		if final { // vider d'abord les flux du choice absents de ce chunk
+			var arr [8]skey
+			present := arr[:0]
+			each(ev, dv, func(ks, ke, vs, ve int) {
+				if f := chatField(ev[ks+1 : ke-1]); f != 0 && ev[vs] == '"' {
+					present = append(present, skey{kChat, f, a, 0})
+				} else if string(ev[ks+1:ke-1]) == "tool_calls" {
+					elems(ev, vs, func(t0, _ int) {
+						if _, is, ie, ok := field(ev, t0, "index"); ok {
+							present = append(present, skey{kChatTool, 0, a, atoi(ev[is:ie])})
+						}
+					})
 				}
-			}
-			for _, ti := range tcs {
-				tc, _ := ti.(map[string]any)
-				present[cp+"t"+numStr(tc["index"])] = true
-			}
-			r.flushOthers(cp, present)
+			})
+			r.flushExcept(kChat, kChatTool, a, present)
 		}
-		for _, f := range chatTextFields {
-			if s, ok := d[f].(string); ok {
-				d[f] = r.feed(cp+f, s, final, chatSynth(base, c["index"], f, nil))
+		each(ev, dv, func(ks, ke, vs, ve int) {
+			key := ev[ks+1 : ke-1]
+			if f := chatField(key); f != 0 && ev[vs] == '"' {
+				s, isNew := r.slot(skey{kChat, f, a, 0})
+				if isNew {
+					chatPre(s, ev, ds, araw)
+					s.pre = append(s.pre, '"')
+					s.pre = append(s.pre, key...)
+					s.pre = append(s.pre, `":`...)
+					s.suf = append(s.suf, "}}]}\n\n"...)
+				}
+				r.addEdit(vs, ve, s, final)
+				return
 			}
-		}
-		for _, ti := range tcs {
-			tc, _ := ti.(map[string]any)
-			fn, _ := tc["function"].(map[string]any)
-			if s, ok := fn["arguments"].(string); ok {
-				fn["arguments"] = r.feed(cp+"t"+numStr(tc["index"]), s, final, chatSynth(base, c["index"], "", tc["index"]))
+			if string(key) != "tool_calls" || ev[vs] != '[' {
+				return
 			}
-		}
-	}
-	r.write(sseBytes("", encode(m)))
+			elems(ev, vs, func(t0, _ int) {
+				_, is, ie, ok := field(ev, t0, "index")
+				if !ok {
+					return
+				}
+				_, fv, _, ok := field(ev, t0, "function")
+				if !ok || ev[fv] != '{' {
+					return
+				}
+				_, as, ae, ok := field(ev, fv, "arguments")
+				if !ok || ev[as] != '"' {
+					return
+				}
+				s, isNew := r.slot(skey{kChatTool, 0, a, atoi(ev[is:ie])})
+				if isNew {
+					chatPre(s, ev, ds, araw)
+					s.pre = append(s.pre, `"tool_calls":[{"index":`...)
+					s.pre = append(s.pre, ev[is:ie]...)
+					s.pre = append(s.pre, `,"function":{"arguments":`...)
+					s.suf = append(s.suf, "}}]}}]}\n\n"...)
+				}
+				r.addEdit(as, ae, s, final)
+			})
+		})
+	})
 	return true
 }
 
-// flushOthers vide, avant le chunk courant, les slots du choice absents de ce chunk.
-func (r *sseRewriter) flushOthers(prefix string, present map[string]bool) {
-	for i := range r.slots {
-		s := &r.slots[i]
-		if s.used && strings.HasPrefix(s.key, prefix) && !present[s.key] {
-			s.used = false
-			if len(s.buf) > 0 && s.synth != nil {
-				out, n := r.v.Rehydrate(s.buf)
-				r.count += n
-				r.write(s.synth(string(out)))
-			}
-		}
-	}
+func chatPre(s *slot, ev []byte, ds int, araw []byte) {
+	s.pre = append(s.pre, `data: {"id":`...)
+	s.pre = appendRaw(s.pre, ev, ds, "id", `""`)
+	s.pre = append(s.pre, `,"object":"chat.completion.chunk","created":`...)
+	s.pre = appendRaw(s.pre, ev, ds, "created", "0")
+	s.pre = append(s.pre, `,"model":`...)
+	s.pre = appendRaw(s.pre, ev, ds, "model", `""`)
+	s.pre = append(s.pre, `,"choices":[{"index":`...)
+	s.pre = append(s.pre, araw...)
+	s.pre = append(s.pre, `,"delta":{`...)
 }
 
-func chatSynth(base map[string]any, idx any, field string, toolIdx any) func(string) []byte {
-	return func(text string) []byte {
-		d := map[string]any{}
-		if field != "" {
-			d[field] = text
-		} else {
-			d["tool_calls"] = []any{map[string]any{"index": toolIdx, "function": map[string]any{"arguments": text}}}
-		}
-		m := map[string]any{}
-		for k, v := range base {
-			m[k] = v
-		}
-		m["choices"] = []any{map[string]any{"index": idx, "delta": d}}
-		return sseBytes("", encode(m))
+func appendRaw(dst, b []byte, obj int, key, def string) []byte {
+	if _, vs, ve, ok := field(b, obj, key); ok {
+		return append(dst, b[vs:ve]...)
 	}
+	return append(dst, def...)
 }
 
 // --- OpenAI Responses ----------------------------------------------------
 
-func (r *sseRewriter) responses(ev, data []byte) bool {
-	m, ok := decode(data)
-	if !ok {
+func (r *sseRewriter) responses(ev []byte, ds int) bool {
+	_, ts, te, ok := field(ev, ds, "type")
+	if !ok || te-ts < 2 {
 		return false
 	}
-	typ, _ := m["type"].(string)
-	prefix := "r" + numStr(m["output_index"]) + ":"
+	typ := ev[ts+1 : te-1]
+	oi := int32(-1)
+	if _, s0, s1, ok := field(ev, ds, "output_index"); ok {
+		oi = atoi(ev[s0:s1])
+	}
 	switch {
-	case strings.HasSuffix(typ, ".delta"):
-		s, ok := m["delta"].(string)
-		if !ok {
+	case bytes.HasSuffix(typ, sDelta):
+		_, vs, ve, ok := field(ev, ds, "delta")
+		if !ok || ev[vs] != '"' {
 			return false
 		}
-		tmpl := make(map[string]any, len(m))
-		for k, v := range m {
-			tmpl[k] = v
+		ci := int32(0)
+		if _, s0, s1, ok := field(ev, ds, "content_index"); ok {
+			ci = atoi(ev[s0:s1])
 		}
-		key := prefix + numStr(m["content_index"]) + ":" + typ
-		m["delta"] = r.feed(key, s, false, func(text string) []byte {
-			tmpl["delta"] = text
-			return sseBytes(typ, encode(tmpl))
-		})
-		if m["delta"] == "" {
-			return true
+		s, isNew := r.slot(skey{kResp, hash8(typ), oi, ci})
+		if isNew { // même event, tous champs sauf "delta" (générique pour tous les *.delta)
+			s.pre = append(s.pre, "event: "...)
+			s.pre = append(s.pre, typ...)
+			s.pre = append(s.pre, "\ndata: {"...)
+			each(ev, ds, func(ks, ke, vs, ve int) {
+				if string(ev[ks+1:ke-1]) != "delta" {
+					s.pre = append(s.pre, ev[ks:ke]...)
+					s.pre = append(s.pre, ':')
+					s.pre = append(s.pre, ev[vs:ve]...)
+					s.pre = append(s.pre, ',')
+				}
+			})
+			s.pre = append(s.pre, `"delta":`...)
+			s.suf = append(s.suf, "}\n\n"...)
 		}
-		r.write(sseBytes(typ, encode(m)))
+		r.addEdit(vs, ve, s, false)
 		return true
-	case strings.HasSuffix(typ, ".done") && m["output_index"] != nil:
-		r.flushPrefix(prefix)
-	case typ == "response.completed" || typ == "response.failed" || typ == "response.incomplete":
-		r.flushPrefix("")
+	case bytes.HasSuffix(typ, sDone) && oi >= 0:
+		r.flush(kResp, oi)
+	case string(typ) == "response.completed" || string(typ) == "response.failed" || string(typ) == "response.incomplete":
+		r.flush(0, -1)
 	}
 	return false // l'event (texte complet) est réhydraté par remplacement simple
+}
+
+func hash8(b []byte) uint8 {
+	h := uint8(0x9d)
+	for _, c := range b {
+		h = (h ^ c) * 0x1b
+	}
+	return h
 }
 
 // --- Gemini natif (streamGenerateContent?alt=sse) -------------------------
 //
 // Les fragments de texte arrivent dans candidates[].content.parts[].text.
-// Les functionCall arrivent entiers : un remplacement simple suffit.
+// Les functionCall arrivent entiers : le remplacement simple de apply suffit.
 
-func (r *sseRewriter) gemini(ev, data []byte) bool {
-	m, ok := decode(data)
-	if !ok {
+func (r *sseRewriter) gemini(ev []byte, ds int) bool {
+	_, cs, _, ok := field(ev, ds, "candidates")
+	if !ok || ev[cs] != '[' {
 		return false
 	}
-	cands, _ := m["candidates"].([]any)
-	for _, ci := range cands {
-		c, _ := ci.(map[string]any)
-		if c == nil {
-			continue
+	elems(ev, cs, func(c0, _ int) {
+		if ev[c0] != '{' {
+			return
 		}
-		idx := numStr(c["index"])
-		cp := "g" + idx + ":"
-		final := c["finishReason"] != nil
-		content, _ := c["content"].(map[string]any)
-		parts, _ := content["parts"].([]any)
+		a := int32(0)
+		var araw []byte
+		if _, is, ie, ok := field(ev, c0, "index"); ok {
+			a, araw = atoi(ev[is:ie]), ev[is:ie]
+		}
+		_, fr, _, final := field(ev, c0, "finishReason")
+		final = final && ev[fr] != 'n'
+		_, cv, _, ok := field(ev, c0, "content")
+		pv := -1
+		if ok && ev[cv] == '{' {
+			if _, p, _, ok := field(ev, cv, "parts"); ok && ev[p] == '[' {
+				pv = p
+			}
+		}
+		if pv < 0 {
+			if final {
+				r.flush(kGem, a)
+			}
+			return
+		}
 		if final {
-			present := map[string]bool{}
-			for _, pi := range parts {
-				if pt, _ := pi.(map[string]any); pt != nil {
-					present[cp+geminiKind(pt)] = true
+			var arr [4]skey
+			present := arr[:0]
+			elems(ev, pv, func(p0, _ int) {
+				if _, _, _, ok := field(ev, p0, "text"); ok {
+					present = append(present, skey{kGem, geminiThought(ev, p0), a, 0})
 				}
-			}
-			r.flushOthers(cp, present)
+			})
+			r.flushExcept(kGem, kGem, a, present)
 		}
-		for _, pi := range parts {
-			pt, _ := pi.(map[string]any)
-			s, ok := pt["text"].(string)
-			if !ok {
-				continue
+		elems(ev, pv, func(p0, _ int) {
+			if ev[p0] != '{' {
+				return
 			}
-			kind := geminiKind(pt)
-			pt["text"] = r.feed(cp+kind, s, final, geminiSynth(c["index"], kind == "thought"))
-		}
-	}
-	out, n := r.v.Rehydrate(encode(m)) // functionCall.args & co
-	r.count += n
-	r.write(sseBytes("", out))
+			_, vs, ve, ok := field(ev, p0, "text")
+			if !ok || ev[vs] != '"' {
+				return
+			}
+			th := geminiThought(ev, p0)
+			s, isNew := r.slot(skey{kGem, th, a, 0})
+			if isNew {
+				s.pre = append(s.pre, `data: {"candidates":[{`...)
+				if araw != nil {
+					s.pre = append(s.pre, `"index":`...)
+					s.pre = append(s.pre, araw...)
+					s.pre = append(s.pre, ',')
+				}
+				s.pre = append(s.pre, `"content":{"role":"model","parts":[{`...)
+				if th == 1 {
+					s.pre = append(s.pre, `"thought":true,`...)
+				}
+				s.pre = append(s.pre, `"text":`...)
+				s.suf = append(s.suf, "}]}}]}\n\n"...)
+			}
+			r.addEdit(vs, ve, s, final)
+		})
+	})
 	return true
 }
 
-func geminiKind(pt map[string]any) string {
-	if t, _ := pt["thought"].(bool); t {
-		return "thought"
+func geminiThought(ev []byte, part int) uint8 {
+	if _, vs, ve, ok := field(ev, part, "thought"); ok && string(ev[vs:ve]) == "true" {
+		return 1
 	}
-	return "text"
-}
-
-func geminiSynth(idx any, thought bool) func(string) []byte {
-	return func(text string) []byte {
-		part := map[string]any{"text": text}
-		if thought {
-			part["thought"] = true
-		}
-		c := map[string]any{"content": map[string]any{"role": "model", "parts": []any{part}}}
-		if idx != nil {
-			c["index"] = idx
-		}
-		return sseBytes("", encode(map[string]any{"candidates": []any{c}}))
-	}
+	return 0
 }
 
 // --- helpers -------------------------------------------------------------
 
-func decode(data []byte) (map[string]any, bool) {
-	d := json.NewDecoder(bytes.NewReader(data))
-	d.UseNumber() // préserve les nombres tels quels
-	var m map[string]any
-	return m, d.Decode(&m) == nil
-}
-
-func encode(v any) []byte {
-	var b bytes.Buffer
-	e := json.NewEncoder(&b)
-	e.SetEscapeHTML(false)
-	e.Encode(v)
-	return bytes.TrimRight(b.Bytes(), "\n")
-}
-
-func numStr(v any) string {
-	switch n := v.(type) {
-	case json.Number:
-		return n.String()
-	case float64:
-		return strconv.Itoa(int(n))
-	case int:
-		return strconv.Itoa(n)
+// each appelle fn pour chaque champ de l'objet commençant en obj.
+func each(b []byte, obj int, fn func(ks, ke, vs, ve int)) {
+	i := skipWS(b, obj)
+	if i >= len(b) || b[i] != '{' {
+		return
 	}
-	return "0"
+	i++
+	for {
+		i = skipWS(b, i)
+		if i >= len(b) || b[i] != '"' {
+			return
+		}
+		ks := i
+		ke := skipString(b, i)
+		i = skipWS(b, ke)
+		if i >= len(b) || b[i] != ':' {
+			return
+		}
+		vs := skipWS(b, i+1)
+		ve := skipValue(b, vs)
+		fn(ks, ke, vs, ve)
+		i = skipWS(b, ve)
+		if i >= len(b) || b[i] != ',' {
+			return
+		}
+		i++
+	}
 }
 
-func sseBytes(event string, js []byte) []byte {
-	b := make([]byte, 0, len(js)+len(event)+16)
-	if event != "" {
-		b = append(b, "event: "...)
-		b = append(b, event...)
-		b = append(b, '\n')
+// elems appelle fn pour chaque élément du tableau commençant en arr.
+func elems(b []byte, arr int, fn func(vs, ve int)) {
+	i := skipWS(b, arr)
+	if i >= len(b) || b[i] != '[' {
+		return
 	}
-	b = append(b, pData...)
-	b = append(b, js...)
-	return append(b, '\n', '\n')
+	i++
+	for {
+		i = skipWS(b, i)
+		if i >= len(b) || b[i] == ']' {
+			return
+		}
+		vs := i
+		ve := skipValue(b, vs)
+		if ve == vs {
+			return
+		}
+		fn(vs, ve)
+		i = skipWS(b, ve)
+		if i >= len(b) || b[i] != ',' {
+			return
+		}
+		i++
+	}
+}
+
+func atoi(b []byte) int32 {
+	n := int32(0)
+	for _, c := range b {
+		if c >= '0' && c <= '9' {
+			n = n*10 + int32(c-'0')
+		}
+	}
+	return n
+}
+
+const hexd = "0123456789abcdef"
+
+// appendJSONString encode s en string JSON (guillemets compris).
+func appendJSONString(dst, s []byte) []byte {
+	dst = append(dst, '"')
+	last := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 0x20 && c != '"' && c != '\\' {
+			continue
+		}
+		dst = append(dst, s[last:i]...)
+		switch c {
+		case '"', '\\':
+			dst = append(dst, '\\', c)
+		case '\n':
+			dst = append(dst, '\\', 'n')
+		case '\r':
+			dst = append(dst, '\\', 'r')
+		case '\t':
+			dst = append(dst, '\\', 't')
+		default:
+			dst = append(dst, '\\', 'u', '0', '0', hexd[c>>4], hexd[c&0xf])
+		}
+		last = i + 1
+	}
+	dst = append(dst, s[last:]...)
+	return append(dst, '"')
+}
+
+// appendUnescape décode le contenu d'une string JSON (sans guillemets).
+func appendUnescape(dst, raw []byte) []byte {
+	for {
+		i := bytes.IndexByte(raw, '\\')
+		if i < 0 || i+1 >= len(raw) {
+			return append(dst, raw...)
+		}
+		dst = append(dst, raw[:i]...)
+		adv := 2
+		switch c := raw[i+1]; c {
+		case 'n':
+			dst = append(dst, '\n')
+		case 't':
+			dst = append(dst, '\t')
+		case 'r':
+			dst = append(dst, '\r')
+		case 'b':
+			dst = append(dst, '\b')
+		case 'f':
+			dst = append(dst, '\f')
+		case 'u':
+			if i+6 > len(raw) {
+				return dst
+			}
+			r1 := hex4(raw[i+2 : i+6])
+			adv = 6
+			if utf16.IsSurrogate(r1) && i+12 <= len(raw) && raw[i+6] == '\\' && raw[i+7] == 'u' {
+				if d := utf16.DecodeRune(r1, hex4(raw[i+8:i+12])); d != utf8.RuneError {
+					r1, adv = d, 12
+				}
+			}
+			dst = utf8.AppendRune(dst, r1)
+		default: // \" \\ \/
+			dst = append(dst, c)
+		}
+		raw = raw[i+adv:]
+	}
+}
+
+func hex4(b []byte) rune {
+	var r rune
+	for _, c := range b {
+		r <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			r |= rune(c - '0')
+		case c >= 'a' && c <= 'f':
+			r |= rune(c - 'a' + 10)
+		case c >= 'A' && c <= 'F':
+			r |= rune(c - 'A' + 10)
+		}
+	}
+	return r
 }
 
 func (r *sseRewriter) write(b []byte) error {

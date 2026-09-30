@@ -22,7 +22,7 @@ PERF=1 CONC=1 go test -run TestLoad -v .
 | Latence ajoutée, requête de 64 Ko | **0,67 ms** sans secret, **0,76 ms** avec secrets |
 | Latence ajoutée, requête de 512 Ko avec secrets | **5,5 ms** (contre 12,2 ms avant) |
 | Coût du streaming, sans secret connu | **~45 à 75 ns par event** |
-| Coût du streaming, secret connu | **1,2 à 5,3 µs par event**, soit ~8 ms sur une réponse entière |
+| Coût du streaming, secret connu | **0,4 à 1 µs par event**, ~16 allocations **par réponse entière** |
 
 Un appel LLM prend entre 1 et 60 secondes : le surcoût d'envguard est **imperceptible** (moins de 0,5 %).
 
@@ -30,7 +30,8 @@ Un appel LLM prend entre 1 et 60 secondes : le surcoût d'envguard est **imperce
 
 1. **Remplacement multi-motifs en une seule passe** ([replace.go](replace.go)). Un index par premier octet (`[256][]uint16`, construit une fois à chaque nouveau secret) ne teste, à chaque position, que les motifs qui commencent par cet octet, du plus long au plus court. Rien n'est copié tant qu'aucun motif n'est trouvé ; ensuite, **une seule allocation**, quel que soit le nombre de secrets. Avant : une copie complète du body par secret présent.
 2. **Consigne insérée sans décoder le JSON** ([hint.go](hint.go)). Un mini-scanner localise `system`, `instructions`, `messages` ou `systemInstruction` au premier niveau, puis le texte est inséré directement dans les octets. Toutes les formes sont gérées : champ absent, `null`, string, tableau vide ou non, objet Gemini sans `parts`. Bonus : l'ordre des clés et le formatage d'origine sont conservés. L'ancienne méthode passait par une `map` et triait les clés.
-3. **Bonus : secrets déjà connus sans allocation.** Les secrets déjà enregistrés sont vérifiés via `m[string(bytes)]`, que le compilateur Go optimise sans allouer. Avant, chaque secret connu coûtait une conversion `string` par requête.
+3. **Streaming sans décodage JSON** ([sse.go](sse.go)). Les quatre formats (Anthropic, OpenAI Chat, OpenAI Responses, Gemini) sont traités directement sur les octets. Le mini-scanner localise les strings de texte, seules celles-ci sont décodées, dans le buffer réutilisé du slot, puis ré-encodées en place ; le reste de l'event est recopié tel quel. Les events de vidage sont préconstruits une fois par flux, et les clés de slot sont des structs comparables, sans string. Plus de `map[string]any`, plus de closures allouées, plus d'`encoding/json` sur le chemin chaud.
+4. **Bonus : secrets déjà connus sans allocation.** Les secrets déjà enregistrés sont vérifiés via `m[string(bytes)]`, que le compilateur Go optimise sans allouer. Avant, chaque secret connu coûtait une conversion `string` par requête.
 
 ## Avant / après — micro-benchmarks
 
@@ -61,14 +62,16 @@ Sans secret, rien ne change : **0 allocation**, ~187 Mo/s.
 | Mémoire | ~380 Ko | **72 Ko** (le body de sortie) |
 | Allocs | des centaines | **1** |
 
-### Streaming SSE (inchangé, pas ciblé par ces optimisations)
+### Streaming SSE, flux de ~2 000 events avec un secret connu
 
-| Format | Aucun secret connu | Secret connu |
-|---|---|---|
-| Anthropic | 71 ns/event | 1,2 µs/event · ~6 allocs/event |
-| OpenAI Chat | 49 ns/event | 5,3 µs/event · ~43 allocs/event |
-| OpenAI Responses | 75 ns/event | 3,5 µs/event · ~30 allocs/event |
-| Gemini | 43 ns/event | 4,4 µs/event · ~36 allocs/event |
+| Format | Temps/event avant → après | Allocs par flux avant → après | Mémoire par flux avant → après |
+|---|---|---|---|
+| Anthropic | 1,2 µs → **0,37 µs** | 11 570 → **14** | 805 Ko → **38 Ko** |
+| OpenAI Chat | 5,3 µs → **0,91 µs** | 85 876 → **16** | 4,5 Mo → **38 Ko** |
+| OpenAI Responses | 3,5 µs → **0,79 µs** | 59 671 → **18** | 3,1 Mo → **38 Ko** |
+| Gemini | 4,4 µs → **0,99 µs** | 72 118 → **15** | 4,1 Mo → **38 Ko** |
+
+Les ~38 Ko restants correspondent au buffer de lecture (32 Ko) et aux buffers réutilisés, alloués une seule fois par flux. Sans secret connu, rien ne change : relais direct à 45 à 75 ns par event.
 
 ## Avant / après — test de charge de bout en bout
 
@@ -81,7 +84,7 @@ Proxy réel (`httptest`) → faux serveur amont, dans le même process. Les allo
 | 64 Ko sans secret, JSON | 0,82 → **0,67 ms** | 1,1 → **0,95 ms** | 383 → **144** | 148 → **47** |
 | 64 Ko avec secrets, JSON | 1,78 → **0,76 ms** | 2,5 → **1,0 ms** | 2 129 → **227** | 596 → **75** |
 | 512 Ko avec secrets, JSON | 12,2 → **5,5 ms** | 13,8 → **6,0 ms** | 16 606 → **1 912** | 2 442 → **323** |
-| 64 Ko avec secrets, SSE | 9,2 → **7,8 ms** | 9,9 → **9,1 ms** | 2 971 → **1 113** | 825 → **309** |
+| 64 Ko avec secrets, SSE | 9,2 → **5,7 ms** | 9,9 → **6,6 ms** | 2 971 → **285** | 825 → **100** |
 
 **Charge forte (32 clients en parallèle), 3 000 requêtes :**
 
@@ -90,12 +93,12 @@ Proxy réel (`httptest`) → faux serveur amont, dans le même process. Les allo
 | 64 Ko sans secret, JSON | 5 123 → **6 529** | 21 → **16 ms** | 109 → **64** | 34 → **30 Mo** |
 | 64 Ko avec secrets, JSON | 2 136 → **5 659** (×2,6) | 36 → **18 ms** | 542 → **92** | 46 → **34 Mo** |
 | 512 Ko avec secrets, JSON | 402 → **859** (×2,1) | 190 → **126 ms** | 915 → **99** | 198 → **122 Mo** |
-| 64 Ko avec secrets, SSE | 330 → **380** | 230 → **225 ms** | 892 → **310** | 199 → **122 Mo** |
+| 64 Ko avec secrets, SSE | 330 → **426** | 230 → **190 ms** | 892 → **74** | 199 → **114 Mo** |
 
 Sous charge, la latence mesure surtout la file d'attente CPU : client, proxy et amont partagent les 8 cœurs. Sur une mesure intermédiaire, le p99 du scénario 512 Ko a une fois atteint 344 ms : c'est un pic isolé qui ne s'est pas reproduit.
 
 ## Ce qui reste
 
-1. **Streaming OpenAI et Gemini avec un secret connu** : 30 à 45 allocations par event, dues au passage par `map[string]any`. Des structs typées, avec `json.RawMessage` pour conserver les champs inconnus, diviseraient ce coût par 4 à 5. C'est aujourd'hui le principal poste d'allocations restant (~11 700 allocs par réponse streamée).
+1. **Streaming : le coût est désormais dominé par l'envoi, pas par le traitement.** Sur les ~5,7 ms ajoutés à un flux de 2 000 events, le traitement lui-même compte pour environ 1 ms. Le reste vient vraisemblablement (non mesuré séparément) de la pile HTTP et du `Flush` fait après chaque event, pour ne pas retarder l'affichage côté client. Regrouper les flushs réduirait ce coût, mais ajouterait de la latence visible : ce compromis n'en vaut pas la peine.
 2. **Débit du scan de détection** : ~117 à 187 Mo/s, limité par la vérification octet par octet des préfixes et des mots-clés. Un pré-filtre sur les octets de début de préfixe pourrait le doubler. Utile seulement pour des contextes de plusieurs Mo.
 3. **`Holdback` guidé par le premier caractère** : utile au-delà d'une cinquantaine de secrets.
