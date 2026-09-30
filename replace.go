@@ -4,8 +4,8 @@ package main
 //
 // Index par premier octet : pour chaque position, on ne teste que les motifs
 // qui commencent par cet octet (du plus long au plus court). Aucun octet
-// n'est recopié tant qu'aucun motif n'a été trouvé ; ensuite, une seule
-// allocation pour la sortie, quel que soit le nombre de secrets.
+// n'est recopié tant qu'aucun motif n'a été trouvé ; ensuite la sortie est
+// écrite dans dst (réutilisé par l'appelant), qui n'est agrandi qu'au besoin.
 type matcher struct {
 	pairs []pair
 	first [256][]uint16
@@ -32,7 +32,9 @@ func newMatcher(ps []pair) *matcher {
 	return m
 }
 
-func (m *matcher) replace(b []byte) ([]byte, int) {
+// replace renvoie b tel quel si aucun motif n'est présent (dst intact),
+// sinon dst[:0] rempli. dst ne doit pas chevaucher b.
+func (m *matcher) replace(dst, b []byte) ([]byte, int) {
 	if m == nil || len(m.pairs) == 0 {
 		return b, 0
 	}
@@ -52,8 +54,11 @@ func (m *matcher) replace(b []byte) ([]byte, int) {
 			i++
 			continue
 		}
-		if out == nil {
-			out = make([]byte, 0, len(b)+len(b)>>4+64)
+		if n == 0 {
+			out = dst[:0]
+			if want := len(b) + len(b)>>4 + 64; cap(out) < want {
+				out = make([]byte, 0, want)
+			}
 		}
 		p := &m.pairs[hit]
 		out = append(out, b[last:i]...)
@@ -62,7 +67,7 @@ func (m *matcher) replace(b []byte) ([]byte, int) {
 		last = i
 		n++
 	}
-	if out == nil {
+	if n == 0 {
 		return b, 0
 	}
 	return append(out, b[last:]...), n

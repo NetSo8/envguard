@@ -7,7 +7,8 @@ import (
 
 // Injection de la consigne par insertion d'octets, sans décoder le JSON :
 // on localise le champ voulu au premier niveau avec un mini-scanner, puis on
-// insère le texte à la bonne place. Une seule allocation (le body de sortie).
+// insère le texte à la bonne place, dans le buffer `dst` fourni par l'appelant
+// (réutilisé d'une requête à l'autre : aucune allocation une fois sa capacité atteinte).
 
 var (
 	hintStr, _ = json.Marshal(hint)          // "…" (avec guillemets)
@@ -20,42 +21,42 @@ var (
 
 // injectHint ajoute une consigne constante. Constante => le préfixe reste
 // identique d'un tour à l'autre, le prompt caching tient.
-func injectHint(body []byte, path string) []byte {
+func injectHint(dst, body []byte, path string) []byte {
 	switch {
 	case strings.HasSuffix(path, "/messages"):
-		return textField(body, "system")
+		return textField(dst, body, "system")
 	case strings.HasSuffix(path, "/responses"):
-		return textField(body, "instructions")
+		return textField(dst, body, "instructions")
 	case strings.Contains(path, ":generateContent") || strings.Contains(path, ":streamGenerateContent"):
-		return gemini(body)
+		return gemini(dst, body)
 	case strings.HasSuffix(path, "/chat/completions"):
 		_, vs, ve, ok := field(body, 0, "messages")
 		if !ok || body[vs] != '[' {
 			return body
 		}
-		return arrayPrepend(body, vs, ve, hintChat)
+		return arrayPrepend(dst, body, vs, ve, hintChat)
 	}
 	return body
 }
 
 // textField : champ absent, null, string ou tableau de blocs texte.
-func textField(b []byte, key string) []byte {
+func textField(dst, b []byte, key string) []byte {
 	_, vs, ve, ok := field(b, 0, key)
 	if !ok {
-		return objInsert(b, 0, key, hintStr)
+		return objInsert(dst, b, 0, key, hintStr)
 	}
 	switch b[vs] {
 	case '"': // "…" → "…\n\n<hint>"
-		return splice(b, ve-1, ve-1, []byte(`\n\n`), hintInner)
+		return splice(dst, b, ve-1, ve-1, []byte(`\n\n`), hintInner)
 	case '[':
-		return arrayAppend(b, vs, ve, hintBlock)
+		return arrayAppend(dst, b, vs, ve, hintBlock)
 	case 'n': // null
-		return splice(b, vs, ve, hintStr)
+		return splice(dst, b, vs, ve, hintStr)
 	}
 	return b
 }
 
-func gemini(b []byte) []byte {
+func gemini(dst, b []byte) []byte {
 	key := "systemInstruction"
 	_, vs, ve, ok := field(b, 0, key)
 	if !ok {
@@ -63,30 +64,33 @@ func gemini(b []byte) []byte {
 		_, vs, ve, ok = field(b, 0, key)
 	}
 	if !ok {
-		return objInsert(b, 0, "systemInstruction", hintGemini)
+		return objInsert(dst, b, 0, "systemInstruction", hintGemini)
 	}
 	if b[vs] != '{' {
 		return b
 	}
 	_, ps, pe, ok := field(b, vs, "parts")
 	if !ok {
-		return objInsert(b, vs, "parts", []byte(`[`+string(hintPart)+`]`))
+		return objInsert(dst, b, vs, "parts", []byte(`[`+string(hintPart)+`]`))
 	}
 	if b[ps] != '[' {
 		return b
 	}
 	_ = ve
-	return arrayAppend(b, ps, pe, hintPart)
+	return arrayAppend(dst, b, ps, pe, hintPart)
 }
 
 // --- édition ---------------------------------------------------------------
 
-func splice(b []byte, from, to int, ins ...[]byte) []byte {
+func splice(dst, b []byte, from, to int, ins ...[]byte) []byte {
 	n := len(b) - (to - from)
 	for _, x := range ins {
 		n += len(x)
 	}
-	out := make([]byte, 0, n)
+	out := dst[:0]
+	if cap(out) < n {
+		out = make([]byte, 0, n+n>>3) // marge : la taille des requêtes varie peu
+	}
 	out = append(out, b[:from]...)
 	for _, x := range ins {
 		out = append(out, x...)
@@ -95,7 +99,7 @@ func splice(b []byte, from, to int, ins ...[]byte) []byte {
 }
 
 // objInsert ajoute "key":val en tête de l'objet commençant à obj.
-func objInsert(b []byte, obj int, key string, val []byte) []byte {
+func objInsert(dst, b []byte, obj int, key string, val []byte) []byte {
 	o := skipWS(b, obj)
 	if o >= len(b) || b[o] != '{' {
 		return b
@@ -104,23 +108,23 @@ func objInsert(b []byte, obj int, key string, val []byte) []byte {
 	if j := skipWS(b, o+1); j < len(b) && b[j] == '}' {
 		sep = nil
 	}
-	return splice(b, o+1, o+1, []byte(`"`+key+`":`), val, sep)
+	return splice(dst, b, o+1, o+1, []byte(`"`+key+`":`), val, sep)
 }
 
-func arrayPrepend(b []byte, vs, ve int, el []byte) []byte {
+func arrayPrepend(dst, b []byte, vs, ve int, el []byte) []byte {
 	sep := []byte(",")
 	if skipWS(b, vs+1) == ve-1 { // tableau vide
 		sep = nil
 	}
-	return splice(b, vs+1, vs+1, el, sep)
+	return splice(dst, b, vs+1, vs+1, el, sep)
 }
 
-func arrayAppend(b []byte, vs, ve int, el []byte) []byte {
+func arrayAppend(dst, b []byte, vs, ve int, el []byte) []byte {
 	sep := []byte(",")
 	if skipWS(b, vs+1) == ve-1 {
 		sep = nil
 	}
-	return splice(b, ve-1, ve-1, sep, el)
+	return splice(dst, b, ve-1, ve-1, sep, el)
 }
 
 // --- mini-scanner JSON -------------------------------------------------------

@@ -93,33 +93,47 @@ func (v *Vault) register(kind, pfx, secret string) {
 
 // Mask détecte les nouveaux secrets puis remplace tous les secrets connus.
 // Renvoie b tel quel (zéro copie) si rien n'est à masquer.
-func (v *Vault) Mask(b []byte) ([]byte, int) {
+func (v *Vault) Mask(b []byte) ([]byte, int) { return v.MaskTo(nil, b) }
+
+// MaskTo est Mask avec un buffer de sortie réutilisable (voir matcher.replace).
+func (v *Vault) MaskTo(dst, b []byte) ([]byte, int) {
 	if v.paused.Load() {
 		return b, 0
 	}
-	// Spans collectés dans un tableau sur la pile (cas courant < 32).
+	// On ne collecte que les secrets inconnus (m[string(bytes)] n'alloue pas) :
+	// le tableau sur la pile suffit, les secrets déjà vus ne coûtent rien.
 	var arr [32]span
 	spans := arr[:0]
-	scan(b, func(s span) { spans = append(spans, s) })
-	v.mu.Lock()
-	for _, s := range spans {
-		// m[string(bytes)] n'alloue pas : les secrets déjà connus ne coûtent rien
-		if _, known := v.fwd[string(b[s.s:s.e])]; known {
-			continue
+	v.mu.RLock()
+	scan(b, func(s span) {
+		if _, known := v.fwd[string(b[s.s:s.e])]; !known {
+			spans = append(spans, s)
 		}
-		v.register(s.kind, s.pfx, string(b[s.s:s.e]))
-	}
+	})
 	m := v.maskM
-	v.mu.Unlock()
-	return m.replace(b)
+	v.mu.RUnlock()
+	if len(spans) > 0 { // rare : nouveaux secrets
+		v.mu.Lock()
+		for _, s := range spans {
+			if _, known := v.fwd[string(b[s.s:s.e])]; !known {
+				v.register(s.kind, s.pfx, string(b[s.s:s.e]))
+			}
+		}
+		m = v.maskM
+		v.mu.Unlock()
+	}
+	return m.replace(dst, b)
 }
 
 // Rehydrate remplace les placeholders par les vrais secrets.
-func (v *Vault) Rehydrate(b []byte) ([]byte, int) {
+func (v *Vault) Rehydrate(b []byte) ([]byte, int) { return v.RehydrateTo(nil, b) }
+
+// RehydrateTo est Rehydrate avec un buffer de sortie réutilisable.
+func (v *Vault) RehydrateTo(dst, b []byte) ([]byte, int) {
 	v.mu.RLock()
 	m := v.rehyM
 	v.mu.RUnlock()
-	return m.replace(b)
+	return m.replace(dst, b)
 }
 
 // Holdback : nombre d'octets de fin de s qui pourraient être le début d'un

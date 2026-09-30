@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"sync"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -61,7 +62,21 @@ type sseRewriter struct {
 	ne    int
 	out   []byte // buffers réutilisés d'un event à l'autre
 	tmp   []byte
-	count int // nb de réhydratations
+	reh   []byte // sortie des réhydratations
+	count int    // nb de réhydratations
+}
+
+// Lecteurs de 32 Ko réutilisés d'un flux à l'autre.
+var readerPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 32<<10) }}
+
+// rehydrate réhydrate b dans le buffer réutilisé r.reh (b tel quel si rien à faire).
+func (r *sseRewriter) rehydrate(b []byte) []byte {
+	out, n := r.v.RehydrateTo(r.reh, b)
+	if n > 0 {
+		r.reh = out
+		r.count += n
+	}
+	return out
 }
 
 var (
@@ -77,8 +92,15 @@ var (
 	sDone      = []byte(".done")
 )
 
+// run lit le flux amont event par event. Les events sont écrits sans flush ;
+// on ne flush que lorsque tout ce que l'amont a envoyé a été traité
+// (br.Buffered() == 0) : un seul envoi réseau par rafale, et aucune latence
+// ajoutée puisque rien de ce qui est déjà arrivé n'est retenu.
 func (r *sseRewriter) run(src io.Reader) error {
-	br := bufio.NewReaderSize(src, 32<<10)
+	br := readerPool.Get().(*bufio.Reader)
+	br.Reset(src)
+	defer func() { br.Reset(nil); readerPool.Put(br) }()
+	defer r.flushOut()
 	var ev []byte // event courant, buffer réutilisé
 	for {
 		line, err := br.ReadSlice('\n')
@@ -89,6 +111,9 @@ func (r *sseRewriter) run(src io.Reader) error {
 					return werr
 				}
 				ev = ev[:0]
+				if br.Buffered() == 0 {
+					r.flushOut()
+				}
 			}
 		}
 		if err == bufio.ErrBufferFull {
@@ -155,9 +180,7 @@ func (r *sseRewriter) event(ev []byte) error {
 	if handled && r.ne > 0 {
 		return r.apply(ev)
 	}
-	out, n := r.v.Rehydrate(ev)
-	r.count += n
-	return r.write(out)
+	return r.write(r.rehydrate(ev))
 }
 
 // apply recopie l'event en réécrivant les strings collectées (ordre du document).
@@ -173,9 +196,7 @@ func (r *sseRewriter) apply(ev []byte) error {
 	r.out = out
 	// Placeholders complets hors des strings de texte (functionCall, ids…).
 	if bytes.Contains(out, marker) {
-		reh, n := r.v.Rehydrate(out)
-		r.count += n
-		out = reh
+		out = r.rehydrate(out)
 	}
 	return r.write(out)
 }
@@ -214,18 +235,14 @@ func (r *sseRewriter) addEdit(vs, ve int, s *slot, final bool) {
 func (r *sseRewriter) feed(s *slot, raw []byte, final bool, out []byte) []byte {
 	if s == nil {
 		r.tmp = appendUnescape(r.tmp[:0], raw)
-		reh, n := r.v.Rehydrate(r.tmp)
-		r.count += n
-		return appendJSONString(out, reh)
+		return appendJSONString(out, r.rehydrate(r.tmp))
 	}
 	s.buf = appendUnescape(s.buf, raw)
 	keep := 0
 	if !final {
 		keep = r.v.Holdback(s.buf)
 	}
-	reh, n := r.v.Rehydrate(s.buf[:len(s.buf)-keep])
-	r.count += n
-	out = appendJSONString(out, reh) // copie avant de décaler le buffer
+	out = appendJSONString(out, r.rehydrate(s.buf[:len(s.buf)-keep])) // copie avant de décaler le buffer
 	s.buf = s.buf[:copy(s.buf, s.buf[len(s.buf)-keep:])]
 	if final {
 		s.used = false
@@ -238,8 +255,7 @@ func (r *sseRewriter) flushSlot(s *slot) {
 	if len(s.buf) == 0 {
 		return
 	}
-	reh, n := r.v.Rehydrate(s.buf)
-	r.count += n
+	reh := r.rehydrate(s.buf)
 	t := append(r.tmp[:0], s.pre...)
 	t = appendJSONString(t, reh)
 	t = append(t, s.suf...)
@@ -737,8 +753,11 @@ func hex4(b []byte) rune {
 
 func (r *sseRewriter) write(b []byte) error {
 	_, err := r.w.Write(b)
+	return err
+}
+
+func (r *sseRewriter) flushOut() {
 	if r.fl != nil {
 		r.fl.Flush()
 	}
-	return err
 }

@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -217,7 +219,7 @@ func TestResponsesSplit(t *testing.T) {
 }
 
 func TestChatHint(t *testing.T) {
-	out := injectHint([]byte(`{"model":"gpt","messages":[{"role":"user","content":"hi"}]}`), "/v1/chat/completions")
+	out := injectHint(nil, []byte(`{"model":"gpt","messages":[{"role":"user","content":"hi"}]}`), "/v1/chat/completions")
 	if !bytes.Contains(out, []byte(`"role":"system"`)) || bytes.Index(out, []byte("masked secrets")) > bytes.Index(out, []byte(`"hi"`)) {
 		t.Fatalf("%s", out)
 	}
@@ -293,7 +295,7 @@ func TestRouting(t *testing.T) {
 }
 
 func TestGeminiHint(t *testing.T) {
-	out := injectHint([]byte(`{"contents":[],"systemInstruction":{"parts":[{"text":"be nice"}]}}`), "/v1beta/models/g:streamGenerateContent")
+	out := injectHint(nil, []byte(`{"contents":[],"systemInstruction":{"parts":[{"text":"be nice"}]}}`), "/v1beta/models/g:streamGenerateContent")
 	if !bytes.Contains(out, []byte("be nice")) || !bytes.Contains(out, []byte("masked secrets")) {
 		t.Fatalf("%s", out)
 	}
@@ -318,7 +320,7 @@ func TestHintShapes(t *testing.T) {
 		{"/v1beta/models/g:generateContent", `{"systemInstruction":{"role":"user"}}`, `"parts":[{"text"`},
 	}
 	for _, c := range cases {
-		out := injectHint([]byte(c.in), c.path)
+		out := injectHint(nil, []byte(c.in), c.path)
 		if !json.Valid(out) {
 			t.Errorf("%s: JSON invalide: %s", c.in, out)
 		}
@@ -333,7 +335,7 @@ func BenchmarkHint64KB(b *testing.B) {
 	b.SetBytes(int64(len(body)))
 	b.ReportAllocs()
 	for b.Loop() {
-		injectHint(body, "/v1/messages")
+		injectHint(nil, body, "/v1/messages")
 	}
 }
 
@@ -400,5 +402,101 @@ func TestSSEEscapes(t *testing.T) {
 		if got.String() != want {
 			t.Fatalf("esc=%v:\n got %q\nwant %q", esc, got.String(), want)
 		}
+	}
+}
+
+// Réutilisation des buffers : un dst déjà rempli ne doit pas polluer la sortie.
+func TestMaskToReuse(t *testing.T) {
+	v := NewVault("")
+	dst := []byte("ancien contenu très long qui ne doit pas réapparaître ................")
+	out, n := v.MaskTo(dst, []byte(`{"k":"`+key+`"}`))
+	if n != 1 || string(out) != `{"k":"`+placeholder("sk-ant-", key)+`"}` {
+		t.Fatalf("%d %s", n, out)
+	}
+	back, n := v.RehydrateTo(out[len(out):], out) // dst sans chevauchement
+	if n != 1 || string(back) != `{"k":"`+key+`"}` {
+		t.Fatalf("%d %s", n, back)
+	}
+	if o, n := v.MaskTo(dst, []byte(`{"k":"rien"}`)); n != 0 || string(o) != `{"k":"rien"}` {
+		t.Fatalf("%d %s", n, o)
+	}
+}
+
+// Buffers poolés sous concurrence : chaque réponse doit correspondre à SA requête.
+func TestProxyConcurrentPool(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(b) // écho : la réponse contient les placeholders de la requête
+	}))
+	defer up.Close()
+	ps, _ := parseProviders([]provider{{name: "anthropic", base: up.URL}, {name: "openai", base: up.URL}})
+	p := &Proxy{providers: ps, v: NewVault(""), cl: up.Client(), events: make(chan Event, 1)}
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+	var wg sync.WaitGroup
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				secret := fmt.Sprintf("sk-ant-api03-g%02di%03d-AbCdEfGhIjKlMnOpQrStUvWx", g, i)
+				pad := strings.Repeat("x", (g*97+i*13)%4000) // tailles variées
+				in := `{"messages":[{"role":"user","content":"` + pad + ` ` + secret + `"}]}`
+				resp, err := http.Post(srv.URL+"/anthropic/v1/messages", "application/json", strings.NewReader(in))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				out, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if string(out) != in {
+					t.Errorf("g%d i%d : réponse différente de la requête", g, i)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+}
+
+type burstReader struct{ parts [][]byte }
+
+func (b *burstReader) Read(p []byte) (int, error) {
+	if len(b.parts) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, b.parts[0])
+	b.parts[0] = b.parts[0][n:]
+	if len(b.parts[0]) == 0 {
+		b.parts = b.parts[1:]
+	}
+	return n, nil
+}
+
+type countFlusher struct{ n int }
+
+func (c *countFlusher) Flush() { c.n++ }
+
+// Envoi groupé : un flush par rafale reçue de l'amont, pas un par event.
+func TestSSEBatchedFlush(t *testing.T) {
+	v := NewVault("")
+	v.Mask([]byte(key))
+	burst := func(n int) []byte {
+		var b bytes.Buffer
+		for i := 0; i < n; i++ {
+			d, _ := json.Marshal(deltaEvent{Type: "content_block_delta", Index: 0, Delta: delta{Type: "text_delta", Text: "mot "}})
+			b.WriteString("event: content_block_delta\ndata: " + string(d) + "\n\n")
+		}
+		return b.Bytes()
+	}
+	var out bytes.Buffer
+	fl := &countFlusher{}
+	(&sseRewriter{v: v, w: &out, fl: fl}).run(&burstReader{parts: [][]byte{burst(200), burst(300), burst(1)}})
+	if got := strings.Count(out.String(), "data: "); got != 501 {
+		t.Fatalf("%d events relayés, attendu 501", got)
+	}
+	if fl.n < 3 || fl.n > 6 { // 3 rafales (+ flush final)
+		t.Fatalf("%d flush pour 3 rafales", fl.n)
 	}
 }

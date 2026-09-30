@@ -282,3 +282,46 @@ func TestLoad(t *testing.T) {
 			r.allocsPerReq, r.bytesPerReq/1024, r.gcCycles, float64(r.heapInuse)/(1<<20), float64(r.sysMem)/(1<<20))
 	}
 }
+
+// Variantes « To » : buffer de sortie réutilisé, comme dans le proxy.
+func BenchmarkMaskTo(b *testing.B) {
+	for _, sz := range sizes {
+		body := convo(sz, 8)
+		b.Run(sizeName(sz), func(b *testing.B) {
+			v := NewVault("")
+			v.Mask(body)
+			var dst []byte
+			b.SetBytes(int64(len(body)))
+			b.ReportAllocs()
+			for b.Loop() {
+				dst, _ = v.MaskTo(dst, body)
+			}
+		})
+	}
+}
+
+func BenchmarkRehydrateTo(b *testing.B) {
+	v := NewVault("")
+	v.Mask(convo(64<<10, 8))
+	for _, sz := range sizes {
+		masked, _ := v.Mask(convo(sz, 8))
+		b.Run(sizeName(sz), func(b *testing.B) {
+			var dst []byte
+			b.SetBytes(int64(len(masked)))
+			b.ReportAllocs()
+			for b.Loop() {
+				dst, _ = v.RehydrateTo(dst, masked)
+			}
+		})
+	}
+}
+
+func BenchmarkHintTo64KB(b *testing.B) {
+	body := convo(64<<10, 0)
+	var dst []byte
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	for b.Loop() {
+		dst = injectHint(dst, body, "/v1/messages")
+	}
+}
