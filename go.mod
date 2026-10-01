@@ -1,4 +1,4 @@
-module envguard
+module github.com/NetSo8/envguard
 
 go 1.27.1
 
