@@ -1,2 +1,3 @@
 envguard
 .envguard_allow
+*.test

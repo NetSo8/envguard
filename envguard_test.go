@@ -54,7 +54,7 @@ func TestDeterministic(t *testing.T) {
 	v := NewVault("")
 	a, _ := v.Mask([]byte(`{"a":"` + key + `"}`))
 	b, _ := v.Mask([]byte(`{"b":"` + key + `","c":"` + key + `"}`))
-	ph := placeholder("sk-ant-", key)
+	ph := v.Placeholder("sk-ant-", key)
 	if !bytes.Contains(a, []byte(ph)) || bytes.Count(b, []byte(ph)) != 2 || bytes.Contains(b, []byte(key)) {
 		t.Fatalf("%s / %s", a, b)
 	}
@@ -67,7 +67,7 @@ func TestDeterministic(t *testing.T) {
 func TestSSESplit(t *testing.T) {
 	v := NewVault("")
 	v.Mask([]byte(key))
-	ph := placeholder("sk-ant-", key)
+	ph := v.Placeholder("sk-ant-", key)
 	full := "curl -H \"x-api-key: " + ph + "\" https://x"
 	for cut := 1; cut < len(full); cut++ {
 		var src bytes.Buffer
@@ -100,6 +100,7 @@ func collect(t *testing.T, s string) string {
 
 // Bout en bout : l'amont ne voit jamais la clé, le client la récupère.
 func TestProxyE2E(t *testing.T) {
+	v := NewVault("")
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		if bytes.Contains(b, []byte(key)) {
@@ -108,11 +109,11 @@ func TestProxyE2E(t *testing.T) {
 		if !bytes.Contains(b, []byte("REDACTED_")) || !bytes.Contains(b, []byte("masked secrets")) {
 			t.Errorf("body amont: %s", b)
 		}
-		w.Write([]byte(`{"content":[{"type":"text","text":"use ` + placeholder("sk-ant-", key) + `"}]}`))
+		w.Write([]byte(`{"content":[{"type":"text","text":"use ` + v.Placeholder("sk-ant-", key) + `"}]}`))
 	}))
 	defer up.Close()
 	ps, _ := parseProviders([]provider{{name: "anthropic", base: up.URL}, {name: "openai", base: up.URL}})
-	p := &Proxy{providers: ps, v: NewVault(""), cl: up.Client(), hint: true, events: make(chan Event, 16)}
+	p := &Proxy{providers: ps, v: v, cl: up.Client(), hint: true, events: make(chan Event, 16)}
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 	resp, err := http.Post(srv.URL+"/v1/messages", "application/json",
@@ -140,7 +141,7 @@ func BenchmarkMaskClean(b *testing.B) {
 func TestChatSplit(t *testing.T) {
 	v := NewVault("")
 	v.Mask([]byte(key))
-	ph := placeholder("sk-ant-", key)
+	ph := v.Placeholder("sk-ant-", key)
 	full := `{"cmd":"curl -H 'x-api-key: ` + ph + `'"}`
 	want := strings.Replace(full, ph, key, 1)
 	for cut := 1; cut < len(full); cut++ {
@@ -190,7 +191,7 @@ func TestChatSplit(t *testing.T) {
 func TestResponsesSplit(t *testing.T) {
 	v := NewVault("")
 	v.Mask([]byte(key))
-	ph := placeholder("sk-ant-", key)
+	ph := v.Placeholder("sk-ant-", key)
 	full := "key=" + ph + " ok"
 	for cut := 1; cut < len(full); cut++ {
 		var src bytes.Buffer
@@ -229,7 +230,7 @@ func TestChatHint(t *testing.T) {
 func TestGeminiSplit(t *testing.T) {
 	v := NewVault("")
 	v.Mask([]byte(key))
-	ph := placeholder("sk-ant-", key)
+	ph := v.Placeholder("sk-ant-", key)
 	full := "export KEY=" + ph + "\n"
 	want := strings.Replace(full, ph, key, 1)
 	for cut := 1; cut < len(full); cut++ {
@@ -369,7 +370,7 @@ func (d *delta) field() *string {
 func TestSSEEscapes(t *testing.T) {
 	v := NewVault("")
 	v.Mask([]byte(key))
-	ph := placeholder("sk-ant-", key)
+	ph := v.Placeholder("sk-ant-", key)
 	full := "ligne 1\nquote \" back\\slash <b>&</b> é 😀 tab\t " + ph + "\n"
 	want := strings.Replace(full, ph, key, 1)
 	for _, esc := range []bool{false, true} {
@@ -410,7 +411,7 @@ func TestMaskToReuse(t *testing.T) {
 	v := NewVault("")
 	dst := []byte("ancien contenu très long qui ne doit pas réapparaître ................")
 	out, n := v.MaskTo(dst, []byte(`{"k":"`+key+`"}`))
-	if n != 1 || string(out) != `{"k":"`+placeholder("sk-ant-", key)+`"}` {
+	if n != 1 || string(out) != `{"k":"`+v.Placeholder("sk-ant-", key)+`"}` {
 		t.Fatalf("%d %s", n, out)
 	}
 	back, n := v.RehydrateTo(out[len(out):], out) // dst sans chevauchement

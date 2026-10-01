@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 )
@@ -137,14 +138,23 @@ func skipWS(b []byte, i int) int {
 }
 
 // skipString : b[i] == '"', renvoie l'index après le guillemet fermant.
+// IndexByte (vectorisé) saute directement au prochain guillemet ; il est
+// échappé si le nombre de backslashes qui le précèdent est impair.
 func skipString(b []byte, i int) int {
-	for i++; i < len(b); i++ {
-		switch b[i] {
-		case '\\':
-			i++
-		case '"':
-			return i + 1
+	for i++; i < len(b); {
+		k := bytes.IndexByte(b[i:], '"')
+		if k < 0 {
+			return len(b)
 		}
+		q := i + k
+		bs := 0
+		for p := q - 1; p >= i && b[p] == '\\'; p-- {
+			bs++
+		}
+		if bs&1 == 0 {
+			return q + 1
+		}
+		i = q + 1
 	}
 	return len(b)
 }

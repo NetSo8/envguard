@@ -2,13 +2,18 @@ package main
 
 // matcher remplace plusieurs motifs en une seule passe sur le buffer.
 //
-// Index par premier octet : pour chaque position, on ne teste que les motifs
-// qui commencent par cet octet (du plus long au plus court). Aucun octet
-// n'est recopié tant qu'aucun motif n'a été trouvé ; ensuite la sortie est
-// écrite dans dst (réutilisé par l'appelant), qui n'est agrandi qu'au besoin.
+// Filtre sur les deux premiers octets : un bitmap de 65 536 bits (8 Ko, tient
+// dans le cache L1) dit si un motif peut commencer à cette position. Le texte
+// ordinaire contient beaucoup de 's' ou de 'g', mais rarement « sk » suivi
+// d'un motif : la plupart des positions coûtent un seul test de bit. Ensuite,
+// index par premier octet (du plus long au plus court). Aucun octet n'est
+// recopié tant qu'aucun motif n'a été trouvé ; la sortie est écrite dans dst
+// (réutilisé par l'appelant), qui n'est agrandi qu'au besoin.
 type matcher struct {
 	pairs []pair
 	first [256][]uint16
+	two   [1 << 16 / 64]uint64 // bit (a<<8|b) : un motif commence par « ab »
+	short bool                 // un motif d'un seul octet : filtre inutilisable
 }
 
 func newMatcher(ps []pair) *matcher {
@@ -16,6 +21,12 @@ func newMatcher(ps []pair) *matcher {
 	for i, p := range ps {
 		if len(p.from) == 0 {
 			continue
+		}
+		if len(p.from) == 1 {
+			m.short = true
+		} else {
+			x := uint16(p.from[0])<<8 | uint16(p.from[1])
+			m.two[x>>6] |= 1 << (x & 63)
 		}
 		c := p.from[0]
 		// insertion triée par longueur décroissante : le plus long gagne
@@ -34,16 +45,32 @@ func newMatcher(ps []pair) *matcher {
 
 // replace renvoie b tel quel si aucun motif n'est présent (dst intact),
 // sinon dst[:0] rempli. dst ne doit pas chevaucher b.
-func (m *matcher) replace(dst, b []byte) ([]byte, int) {
+func (m *matcher) replace(dst, b []byte) ([]byte, int) { return m.replaceIf(dst, b, nil) }
+
+// replaceIf : comme replace, mais un motif trouvé n'est remplacé que si
+// keep(index de la paire) l'accepte ; sinon il est recopié tel quel.
+func (m *matcher) replaceIf(dst, b []byte, keep func(int) bool) ([]byte, int) {
 	if m == nil || len(m.pairs) == 0 {
 		return b, 0
 	}
 	var out []byte
 	last, n := 0, 0
 	for i := 0; i < len(b); {
-		cands := m.first[b[i]]
+		if !m.short {
+			// Avance tant qu'aucun motif ne peut commencer ici (cas courant).
+			for i+1 < len(b) {
+				x := uint16(b[i])<<8 | uint16(b[i+1])
+				if m.two[x>>6]&(1<<(x&63)) != 0 {
+					break
+				}
+				i++
+			}
+			if i+1 >= len(b) {
+				break
+			}
+		}
 		hit := -1
-		for _, k := range cands {
+		for _, k := range m.first[b[i]] {
 			f := m.pairs[k].from
 			if len(b)-i >= len(f) && string(b[i:i+len(f)]) == string(f) {
 				hit = int(k)
@@ -52,6 +79,10 @@ func (m *matcher) replace(dst, b []byte) ([]byte, int) {
 		}
 		if hit < 0 {
 			i++
+			continue
+		}
+		if keep != nil && !keep(hit) {
+			i += len(m.pairs[hit].from) // motif refusé : laissé intact
 			continue
 		}
 		if n == 0 {

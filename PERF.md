@@ -18,14 +18,79 @@ PERF=1 CONC=1 go test -run TestLoad -v .
 |---|---|
 | Mémoire au repos | **~11 Mo RSS**, binaire de 11,7 Mo |
 | Mémoire en usage normal (1 client) | **18 à 26 Mo** (runtime Go, tas de 3 à 6 Mo) |
-| Mémoire sous forte charge (32 requêtes parallèles, bodies de 512 Ko) | ~120 Mo (contre ~200 Mo avant) |
-| Latence ajoutée, requête de 64 Ko | **0,67 ms** sans secret, **0,76 ms** avec secrets |
-| Latence ajoutée, requête de 512 Ko avec secrets | **5,5 ms** (contre 12,2 ms avant) |
+| Mémoire sous forte charge (32 requêtes parallèles, bodies de 512 Ko) | ~120 à 170 Mo (buffers gardés en réserve dans le pool) |
+| Latence ajoutée, requête de 64 Ko | **0,30 ms** sans secret, **0,32 ms** avec secrets |
+| Latence ajoutée, requête de 512 Ko avec secrets | **2,36 ms** |
+| Latence ajoutée, tour de conversation de 1,5 Mo (cas réel d'un agent) | **0,56 ms** grâce au cache par segment (12,2 ms avant) |
 | Coût du streaming, sans secret connu | **~45 à 75 ns par event** |
 | Coût du streaming, secret connu | **0,4 à 1 µs par event**, ~15 allocations et ~5 Ko **par réponse entière** |
-| Latence ajoutée, réponse streamée (~2 000 events) | **2,3 ms** (contre 9,2 ms au départ) |
+| Latence ajoutée, réponse streamée (~2 000 events) | **1,8 ms** (contre 9,2 ms au départ) |
 
 Un appel LLM prend entre 1 et 60 secondes : le surcoût d'envguard est **imperceptible** (moins de 0,5 %).
+
+## Audit du 01/10/2026 : où en est-on
+
+Mesures avant/après sur le même code de benchmark, l'ancien code étant mesuré dans un worktree au commit `e3d1708`.
+
+| Mesure | Avant | Après | Gain |
+|---|---|---|---|
+| **Tour de conversation de 1,5 Mo** (2 messages nouveaux) | 12,2 ms | **0,56 ms** | **×22** |
+| Scan sans secret | 185 Mo/s | **502 Mo/s** | ×2,7 |
+| Masquage avec secrets (buffer réutilisé) | 117 Mo/s | **324 Mo/s** | ×2,8 |
+| Réhydratation | 498 Mo/s | **1 250 Mo/s** | ×2,5 |
+| Consigne, 64 Ko | 1,26 Go/s | **1,49 Go/s** | ×1,2 |
+| Allocations sur ces chemins | 0 | **0** | — |
+
+De bout en bout, dans le **pire cas** (cache désactivé, chaque requête entièrement nouvelle) :
+
+| Scénario | Avant | Après |
+|---|---|---|
+| Latence ajoutée, JSON 64 Ko sans secret, 1 client | 0,66 à 0,69 ms | **0,30 ms** |
+| Latence ajoutée, JSON 64 Ko avec secrets, 1 client | 0,75 à 0,76 ms | **0,32 ms** |
+| Latence ajoutée, JSON 512 Ko, 1 client | 5,4 à 5,5 ms | **2,36 ms** |
+| Latence ajoutée, SSE ~2 000 events, 1 client | 2,3 ms | **1,82 ms** |
+| Débit JSON 64 Ko avec secrets, 32 clients | 5 427 à 5 434 req/s | **11 523 req/s** (×2,1) |
+| Débit JSON 512 Ko, 32 clients | 760 à 821 req/s | **1 923 req/s** (×2,3) |
+| Débit SSE, 32 clients | 1 329 à 1 355 req/s | **1 841 req/s** |
+| p99 JSON 512 Ko, 32 clients | 104 à 121 ms | **47 ms** |
+
+### Ce qui a été fait
+
+1. **Cache de masquage par segment** ([segcache.go](segcache.go)). Un agent renvoie toute la conversation à chaque tour. Le body est découpé en segments : chaque élément de `messages`, `input`, `contents`, `tools`, `system`, et chaque grosse valeur de premier niveau. Le résultat du masquage de chaque segment est mémorisé.
+   - **Exactitude :** les segments sont coupés entre deux valeurs JSON, donc le scan d'un segment isolé est identique au scan du body entier. Une entrée n'est valable que pour la version courante du vault. Si un nouveau secret apparaît pendant une requête, on recommence. Un test d'équivalence et un fuzzer vérifient l'identité **à l'octet près** avec le masquage direct ; la contre-épreuve (relance désactivée) fait bien échouer le test.
+   - **Clé :** hash 64 bits à graine aléatoire, plus la longueur, plus 16 octets témoins. Le cache garde deux générations de 16 384 entrées (LRU approché).
+2. **Scan** ([detect.go](detect.go)) :
+   - table de classes de caractères (une lecture par octet au lieu de plusieurs comparaisons) ;
+   - règles indexées par premier octet, avec une longueur minimale globale ;
+   - `hasKeyword` en une passe, appelée seulement devant `=` ou `:`.
+3. **Remplacement** ([replace.go](replace.go)) : filtre sur les deux premiers octets (bitmap de 8 Ko, dans le cache L1). La plupart des positions ne coûtent qu'un test de bit.
+4. **`skipString` vectorisé** : `IndexByte` saute directement au prochain guillemet. Cela accélère le découpage en segments et les lectures de champs dans le SSE.
+
+### Ce qui reste, et pourquoi on s'arrête là
+
+- **Le cache est proche de la bande passante mémoire** (~2,7 Go/s) : hachage, découpage et copie du body. Gagner plus demanderait d'éviter la copie, par exemple en envoyant une liste de tranches au lieu d'un buffer contigu, pour quelques dizaines de microsecondes par mégaoctet.
+- **Streaming : 0,3 à 1 µs par event.** Un modèle génère 50 à 200 tokens/s, soit moins de 0,02 % de surcoût. Ce n'est plus un sujet.
+- **Un appel LLM dure de 1 à 60 secondes.** Le surcoût d'envguard est désormais de l'ordre de 0,3 ms pour une requête typique, et de 0,6 ms pour un tour de conversation de 1,5 Mo. Les gains restants ne seraient plus perceptibles.
+
+## Coût des règles gitleaks
+
+Exécuter ~210 expressions régulières sur chaque corps serait 10 à 100 fois trop lent : la première version, naïve, tombait à 29 Mo/s. Les optimisations successives, toutes mesurées :
+
+| Étape | Débit avec secrets, 512 Ko |
+|---|---|
+| Fenêtre de ±768 octets autour de chaque mot-clé | 24 Mo/s |
+| **Règles ancrées** (mot-clé = début du secret, déduit de l'arbre syntaxique de l'expression) : expression lancée seulement si le caractère suivant peut prolonger un secret ; fenêtre limitée à la ligne pour les règles à contexte | 98 Mo/s |
+| Filtre sur un hash des 4 premiers octets des mots-clés | 137 Mo/s |
+| Secret déjà enregistré : pas de revérification | 200 Mo/s |
+| Recherche en début de mot seulement, **fusionnée dans le scan natif** (un seul parcours) | **238 Mo/s** |
+
+| Cas | Natif seul | Natif + gitleaks |
+|---|---|---|
+| Corps de 512 Ko sans secret | ~505 Mo/s | ~315 Mo/s |
+| Corps de 512 Ko avec secrets connus | ~340 Mo/s | ~238 Mo/s |
+| **Tour de conversation de 1,5 Mo** (cas réel, cache par segment) | **0,559 ms** | **0,578 ms** (+3,5 %) |
+
+En usage réel, gitleaks ne coûte presque rien, car le cache par segment ne scanne que les nouveaux messages. Le surcoût (~0,8 ms pour 512 Ko) ne touche que le premier envoi d'un gros contexte jamais vu. Pour s'en passer : `-no-gitleaks`.
 
 ## Optimisations appliquées
 
@@ -147,5 +212,5 @@ Les fourchettes « après » viennent de deux exécutions complètes.
 ## Ce qui reste
 
 1. **Plafonner la taille des buffers remis au pool** (par exemple 1 Mo) si l'empreinte mémoire sous forte charge devient gênante : les très grosses requêtes réallouent alors leur buffer, mais la mémoire retenue reste bornée.
-2. **Débit du scan de détection** : ~117 à 187 Mo/s, limité par la vérification octet par octet des préfixes et des mots-clés. Un pré-filtre sur les octets de début de préfixe pourrait le doubler. Utile seulement pour des contextes de plusieurs Mo.
+2. ~~Débit du scan de détection~~ : fait le 01/10/2026 (185 → 502 Mo/s), et le cache par segment évite de rescanner les conversations.
 3. **`Holdback` guidé par le premier caractère** : utile au-delà d'une cinquantaine de secrets.

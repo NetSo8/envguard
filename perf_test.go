@@ -97,7 +97,7 @@ func BenchmarkRehydrate(b *testing.B) {
 func stream(format string, withPh bool, v *Vault) []byte {
 	ph := ""
 	if withPh {
-		ph = placeholder("sk-ant-", key)
+		ph = v.Placeholder("sk-ant-", key)
 	}
 	text := strings.Repeat("Le handler valide l'identifiant puis appelle le service. ", 180) + ph + " fin."
 	var b bytes.Buffer
@@ -172,7 +172,8 @@ func pct(d []time.Duration, p float64) time.Duration {
 }
 
 func runLoad(t *testing.T, name string, body []byte, streaming bool, conc, total int) loadResult {
-	sse := stream("anthropic", true, nil)
+	v := NewVault("")
+	sse := stream("anthropic", true, v)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		if streaming {
@@ -181,11 +182,11 @@ func runLoad(t *testing.T, name string, body []byte, streaming bool, conc, total
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"content":[{"type":"text","text":"ok ` + placeholder("sk-ant-", key) + `"}]}`))
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok ` + v.Placeholder("sk-ant-", key) + `"}]}`))
 	}))
 	defer up.Close()
 	ps, _ := parseProviders([]provider{{name: "anthropic", base: up.URL}, {name: "openai", base: up.URL}})
-	p := &Proxy{providers: ps, v: NewVault(""), cl: &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 256}}, hint: true, events: make(chan Event, 1)}
+	p := &Proxy{providers: ps, v: v, cl: &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 256}}, hint: true, events: make(chan Event, 1)}
 	p.v.Mask([]byte(key))
 	srv := httptest.NewServer(p)
 	defer srv.Close()

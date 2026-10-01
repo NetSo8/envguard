@@ -30,6 +30,7 @@ type model struct {
 	reqs    int
 	masked  int
 	rehyd   int
+	blocked int
 	lat     time.Duration
 	w, h    int
 }
@@ -97,6 +98,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.masked += e.Masked
 			m.rehyd += e.Rehyd
 			m.lat += e.Dur
+		case evBlocked:
+			m.blocked++
 		case evSecret:
 			m.secrets = append(m.secrets, secretRow{e.Rule, e.Secret, e.Ph})
 		}
@@ -117,7 +120,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cur--
 			}
 		case "p", " ":
-			m.p.v.paused.Store(!m.p.v.paused.Load())
+			m.p.v.SetPaused(!m.p.v.paused.Load())
 		case "a":
 			if m.tab == 1 && m.cur < len(m.secrets) {
 				s := m.secrets[m.cur]
@@ -158,7 +161,7 @@ func (m *model) View() string {
 		card("requêtes", fmt.Sprint(m.reqs), lipgloss.Color("#E5E7EB")),
 		card("secrets", fmt.Sprint(len(m.secrets)), cWarn),
 		card("masqués", fmt.Sprint(m.masked), cAccent),
-		card("réhydratés", fmt.Sprint(m.rehyd), cOK),
+		card("réhydratés", rehydLabel(m.rehyd, m.blocked), rehydColor(m.blocked)),
 		card("latence moy.", avg, lipgloss.Color("#E5E7EB")),
 	}
 	stats := lipgloss.JoinHorizontal(lipgloss.Top, cards...)
@@ -234,6 +237,9 @@ func (m *model) viewLog(rows int) string {
 		case e.Kind == evSecret:
 			fmt.Fprintf(&b, "%s %s %s → %s", lipgloss.NewStyle().Foreground(cWarn).Render("◆ secret"),
 				sMuted.Render(e.Rule), preview(e.Secret), sPh.Render(e.Ph))
+		case e.Kind == evBlocked:
+			fmt.Fprintf(&b, "%s %s vers %s %s", lipgloss.NewStyle().Foreground(cErr).Bold(true).Render("⛔ bloqué"),
+				sPh.Render(e.Ph), e.Path, sMuted.Render("(si légitime : -allow-host "+e.Rule+"="+e.Path+")"))
 		case e.Kind == evErr:
 			b.WriteString(lipgloss.NewStyle().Foreground(cErr).Render("✕ "+e.Path+" : ") + e.Rule)
 		}
@@ -274,4 +280,18 @@ func provBadge(name string) lipgloss.Style {
 		return st
 	}
 	return lipgloss.NewStyle().Foreground(cAccent).Bold(true)
+}
+
+func rehydLabel(n, blocked int) string {
+	if blocked == 0 {
+		return fmt.Sprint(n)
+	}
+	return fmt.Sprintf("%d · %d bloqué(s)", n, blocked)
+}
+
+func rehydColor(blocked int) lipgloss.Color {
+	if blocked > 0 {
+		return cErr
+	}
+	return cOK
 }

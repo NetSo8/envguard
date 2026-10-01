@@ -43,7 +43,11 @@ var defaultProviders = []provider{
 }
 
 // providerFlag permet -provider nom=url (ajout ou surcharge), répétable.
-type providerFlag struct{ ps *[]provider }
+// seen (facultatif) retient les noms donnés explicitement.
+type providerFlag struct {
+	ps   *[]provider
+	seen map[string]bool
+}
 
 func (f providerFlag) String() string { return "" }
 
@@ -51,6 +55,9 @@ func (f providerFlag) Set(s string) error {
 	name, base, ok := strings.Cut(s, "=")
 	if !ok || name == "" || base == "" {
 		return fmt.Errorf("format attendu nom=url")
+	}
+	if f.seen != nil {
+		f.seen[name] = true
 	}
 	for i := range *f.ps {
 		if (*f.ps)[i].name == name {

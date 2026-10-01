@@ -40,17 +40,20 @@ type skey struct {
 }
 
 type slot struct {
-	used bool
-	k    skey
-	buf  []byte // texte en attente, décodé
-	pre  []byte // event synthétique jusqu'à la valeur de la string
-	suf  []byte // après la valeur, "\n\n" compris
+	used  bool
+	k     skey
+	tool  bool   // arguments d'appel d'outil : politique de réhydratation
+	gated bool   // placeholder vu : la suite est retenue jusqu'à la fin de l'appel
+	all   []byte // arguments complets reçus (pour trouver les hôtes cités)
+	buf   []byte // texte en attente, décodé
+	pre   []byte // event synthétique jusqu'à la valeur de la string
+	suf   []byte // après la valeur, "\n\n" compris
 }
 
 type edit struct {
-	vs, ve int
-	s      *slot
-	final  bool
+	vs, ve      int
+	s           *slot
+	final, tool bool
 }
 
 type sseRewriter struct {
@@ -64,10 +67,34 @@ type sseRewriter struct {
 	tmp   []byte
 	reh   []byte // sortie des réhydratations
 	count int    // nb de réhydratations
+
+	pol     *Policy                     // politique des appels d'outils (nil : aucune)
+	onBlock func(kind, host, ph string) // placeholder laissé intact dans un appel d'outil
 }
 
 // Lecteurs de 32 Ko réutilisés d'un flux à l'autre.
 var readerPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 32<<10) }}
+
+// rehydrateTool réhydrate un morceau d'arguments d'outil selon la politique.
+func (r *sseRewriter) rehydrateTool(b, args []byte) []byte {
+	out, n := r.v.RehydrateToolTo(r.reh, b, args, r.pol, r.onBlock)
+	if n > 0 {
+		r.reh = out
+		r.count += n
+	}
+	return out
+}
+
+// rehydrateDoc réhydrate un event entier : librement dans le texte, selon la
+// politique dans les arguments d'outils (done, completed, functionCall…).
+func (r *sseRewriter) rehydrateDoc(b []byte, start int) []byte {
+	out, n := r.v.RehydrateDocTo(r.reh, b, start, r.pol, r.onBlock)
+	if n > 0 {
+		r.reh = out
+		r.count += n
+	}
+	return out
+}
 
 // rehydrate réhydrate b dans le buffer réutilisé r.reh (b tel quel si rien à faire).
 func (r *sseRewriter) rehydrate(b []byte) []byte {
@@ -90,6 +117,8 @@ var (
 	pCands     = []byte(`"candidates"`)
 	sDelta     = []byte(".delta")
 	sDone      = []byte(".done")
+	sArgs      = []byte("arguments")              // response.function_call_arguments.delta…
+	sToolIn    = []byte("custom_tool_call_input") // response.custom_tool_call_input.delta
 )
 
 // run lit le flux amont event par event. Les events sont écrits sans flush ;
@@ -178,25 +207,28 @@ func (r *sseRewriter) event(ev []byte) error {
 		handled = r.chat(ev, ds)
 	}
 	if handled && r.ne > 0 {
-		return r.apply(ev)
+		return r.apply(ev, ds)
 	}
-	return r.write(r.rehydrate(ev))
+	return r.write(r.rehydrateDoc(ev, ds))
 }
 
 // apply recopie l'event en réécrivant les strings collectées (ordre du document).
-func (r *sseRewriter) apply(ev []byte) error {
+func (r *sseRewriter) apply(ev []byte, ds int) error {
 	out, last := r.out[:0], 0
 	for i := 0; i < r.ne; i++ {
 		e := &r.edits[i]
+		if e.ve-e.vs < 2 || e.ve > len(ev) || ev[e.ve-1] != '"' || e.vs < last {
+			continue // string tronquée ou mal formée : recopiée telle quelle
+		}
 		out = append(out, ev[last:e.vs]...)
-		out = r.feed(e.s, ev[e.vs+1:e.ve-1], e.final, out)
+		out = r.feed(e.s, ev[e.vs+1:e.ve-1], e.final, e.tool, out)
 		last = e.ve
 	}
 	out = append(out, ev[last:]...)
 	r.out = out
 	// Placeholders complets hors des strings de texte (functionCall, ids…).
 	if bytes.Contains(out, marker) {
-		out = r.rehydrate(out)
+		out = r.rehydrateDoc(out, ds)
 	}
 	return r.write(out)
 }
@@ -219,30 +251,61 @@ func (r *sseRewriter) slot(k skey) (*slot, bool) {
 	}
 	s := &r.slots[free]
 	s.used, s.k = true, k
-	s.buf, s.pre, s.suf = s.buf[:0], s.pre[:0], s.suf[:0]
+	s.buf, s.pre, s.suf, s.all = s.buf[:0], s.pre[:0], s.suf[:0], s.all[:0]
+	s.tool, s.gated = false, false
 	return s, true
 }
 
-func (r *sseRewriter) addEdit(vs, ve int, s *slot, final bool) {
+func (r *sseRewriter) addEdit(vs, ve int, s *slot, final, tool bool) {
+	if s != nil && tool {
+		s.tool = true
+	}
 	if r.ne < len(r.edits) {
-		r.edits[r.ne] = edit{vs, ve, s, final}
+		r.edits[r.ne] = edit{vs, ve, s, final, tool}
 		r.ne++
 	}
 }
 
 // feed décode le fragment dans le buffer du slot, retient la fin qui pourrait
 // être un début de placeholder, et ajoute à out la string JSON émissible.
-func (r *sseRewriter) feed(s *slot, raw []byte, final bool, out []byte) []byte {
+func (r *sseRewriter) feed(s *slot, raw []byte, final, tool bool, out []byte) []byte {
+	guard := tool && r.pol.active()
 	if s == nil {
 		r.tmp = appendUnescape(r.tmp[:0], raw)
+		if guard {
+			return appendJSONString(out, r.tmp) // sans slot, pas de décision possible : rien n'est remis
+		}
 		return appendJSONString(out, r.rehydrate(r.tmp))
 	}
+	start := len(s.buf)
 	s.buf = appendUnescape(s.buf, raw)
+	if guard {
+		// Le domaine visé peut arriver APRÈS le placeholder dans les
+		// arguments : dès qu'un placeholder apparaît, on retient la suite
+		// jusqu'à la fin de l'appel, puis on décide sur l'appel complet.
+		s.all = append(s.all, s.buf[start:]...)
+		if !s.gated && bytes.Contains(s.buf, marker) {
+			s.gated = true
+		}
+		if s.gated && !final {
+			return appendJSONString(out, nil)
+		}
+	}
 	keep := 0
 	if !final {
 		keep = r.v.Holdback(s.buf)
 	}
-	out = appendJSONString(out, r.rehydrate(s.buf[:len(s.buf)-keep])) // copie avant de décaler le buffer
+	emit := s.buf[:len(s.buf)-keep]
+	var reh []byte
+	switch {
+	case guard && s.gated:
+		reh = r.rehydrateTool(emit, s.all)
+	case guard:
+		reh = emit // aucun placeholder complet (et jamais de variante base64 dans un outil)
+	default:
+		reh = r.rehydrate(emit)
+	}
+	out = appendJSONString(out, reh) // copie avant de décaler le buffer
 	s.buf = s.buf[:copy(s.buf, s.buf[len(s.buf)-keep:])]
 	if final {
 		s.used = false
@@ -255,7 +318,15 @@ func (r *sseRewriter) flushSlot(s *slot) {
 	if len(s.buf) == 0 {
 		return
 	}
-	reh := r.rehydrate(s.buf)
+	var reh []byte
+	switch {
+	case s.tool && r.pol.active() && s.gated:
+		reh = r.rehydrateTool(s.buf, s.all)
+	case s.tool && r.pol.active():
+		reh = s.buf
+	default:
+		reh = r.rehydrate(s.buf)
+	}
 	t := append(r.tmp[:0], s.pre...)
 	t = appendJSONString(t, reh)
 	t = append(t, s.suf...)
@@ -339,7 +410,7 @@ func (r *sseRewriter) anthDelta(ev []byte, ds int) bool {
 		s.pre = append(s.pre, `":`...)
 		s.suf = append(s.suf, "}}\n\n"...)
 	}
-	r.addEdit(vs, ve, s, false)
+	r.addEdit(vs, ve, s, false, f == 2) // partial_json = arguments de tool_use
 	return true
 }
 
@@ -409,7 +480,7 @@ func (r *sseRewriter) chat(ev []byte, ds int) bool {
 					s.pre = append(s.pre, `":`...)
 					s.suf = append(s.suf, "}}]}\n\n"...)
 				}
-				r.addEdit(vs, ve, s, final)
+				r.addEdit(vs, ve, s, final, false)
 				return
 			}
 			if string(key) != "tool_calls" || ev[vs] != '[' {
@@ -436,7 +507,7 @@ func (r *sseRewriter) chat(ev []byte, ds int) bool {
 					s.pre = append(s.pre, `,"function":{"arguments":`...)
 					s.suf = append(s.suf, "}}]}}]}\n\n"...)
 				}
-				r.addEdit(as, ae, s, final)
+				r.addEdit(as, ae, s, final, true)
 			})
 		})
 	})
@@ -500,7 +571,7 @@ func (r *sseRewriter) responses(ev []byte, ds int) bool {
 			s.pre = append(s.pre, `"delta":`...)
 			s.suf = append(s.suf, "}\n\n"...)
 		}
-		r.addEdit(vs, ve, s, false)
+		r.addEdit(vs, ve, s, false, bytes.Contains(typ, sArgs) || bytes.Contains(typ, sToolIn))
 		return true
 	case bytes.HasSuffix(typ, sDone) && oi >= 0:
 		r.flush(kResp, oi)
@@ -586,7 +657,7 @@ func (r *sseRewriter) gemini(ev []byte, ds int) bool {
 				s.pre = append(s.pre, `"text":`...)
 				s.suf = append(s.suf, "}]}}]}\n\n"...)
 			}
-			r.addEdit(vs, ve, s, final)
+			r.addEdit(vs, ve, s, final, false)
 		})
 	})
 	return true
@@ -620,6 +691,9 @@ func each(b []byte, obj int, fn func(ks, ke, vs, ve int)) {
 			return
 		}
 		vs := skipWS(b, i+1)
+		if vs >= len(b) { // JSON tronqué : pas de valeur
+			return
+		}
 		ve := skipValue(b, vs)
 		fn(ks, ke, vs, ve)
 		i = skipWS(b, ve)
