@@ -246,6 +246,8 @@ go test -run '^$' -fuzz FuzzSSE -fuzztime 60s .
 go test -run x -bench . .
 ```
 
+Les faux secrets des tests sont écrits en deux morceaux concaténés (`"SG" + ".ngeV…"`) : écrits d'un seul tenant, la protection anti-fuite de GitHub les prendrait pour de vrais secrets et bloquerait la publication.
+
 ## Licence
 
 [MIT](LICENSE). Les règles de détection de [gitleaks](https://github.com/gitleaks/gitleaks) sont incluses sous leur propre licence MIT, dans [third_party/gitleaks](third_party/gitleaks).
