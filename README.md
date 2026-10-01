@@ -22,7 +22,7 @@ envguard run -- claude
 
 - **Votre clé reste chez vous.** Le fournisseur, ses journaux et ses éventuelles fuites ne voient que des placeholders.
 - **L'agent n'est pas gêné.** Les réponses, les commandes et les appels d'outils reçoivent la vraie valeur, réhydratée côté poste, y compris en streaming.
-- **Les tentatives d'exfiltration visibles sont bloquées** : dans un appel d'outil, une clé n'est remise que vers une destination légitime, et pas vers le domaine qu'une injection de prompt aurait glissé dans la commande. Les limites sont détaillées dans [SECURITY.md](SECURITY.md).
+- **Les tentatives d'exfiltration visibles sont bloquées** : dans un appel d'outil, une clé n'est remise que vers une destination légitime, et pas vers le domaine qu'une injection de prompt aurait glissé dans la commande.
 - **Aucun réglage pour commencer.** `envguard run` démarre l'outil, configure les URL et s'arrête avec lui.
 
 ## Fonctionnalités
@@ -78,7 +78,7 @@ Il écoute alors sur `127.0.0.1:8787`, avec une route par fournisseur :
 ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic claude
 ```
 
-Les commandes pour chaque fournisseur sont dans [docs/PROVIDERS.md](docs/PROVIDERS.md).
+Chaque fournisseur dispose de sa propre route (`/anthropic`, `/openai`, `/gemini`, etc.).
 
 ## Comment ça marche
 
@@ -158,7 +158,6 @@ cd third_party/gitleaks && curl -sfLo gitleaks.toml https://raw.githubuserconten
 - **Requêtes de navigateur refusées** : un en-tête `Origin` ou `Sec-Fetch-Site: cross-site` donne un 403 (sauf `-allow-origin`). Un `Host` non local aussi, contre le DNS rebinding. Les en-têtes CORS de l'amont ne sont jamais relayés.
 - **Corps compressés** : gzip et deflate sont décompressés avant masquage ; tout autre encodage est refusé (415), jamais relayé en aveugle.
 - **Placeholders à clé** : HMAC-SHA256 avec une clé locale. Un placeholder ne permet pas de vérifier hors ligne un secret deviné.
-- Analyse complète, risques restants et limites : [SECURITY.md](SECURITY.md).
 
 ## Performances
 
@@ -171,7 +170,7 @@ cd third_party/gitleaks && curl -sfLo gitleaks.toml https://raw.githubuserconten
 | Coût du streaming, par événement | 0,04 à 1 µs |
 | Mémoire en usage | 15 à 35 Mo |
 
-Un appel à un modèle dure de 1 à 60 secondes : le surcoût est imperceptible. Mesures, méthode et historique des optimisations : [PERF.md](PERF.md).
+Un appel à un modèle dure de 1 à 60 secondes : le surcoût est imperceptible.
 
 ## Options
 
