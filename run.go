@@ -80,6 +80,9 @@ func runCmd(args []string) int {
 	if o.logFile != "" {
 		os.MkdirAll(filepath.Dir(o.logFile), 0o700)
 		logw, _ = os.OpenFile(o.logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if logw != nil {
+			defer logw.Close()
+		}
 	}
 	var mu sync.Mutex
 	var nSecrets, nMasked, nRehyd, nBlocked int

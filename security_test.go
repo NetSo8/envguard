@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -151,7 +152,7 @@ func TestSecKeyedPlaceholders(t *testing.T) {
 		t.Fatal(err)
 	}
 	k2, _ := LoadKey(filepath.Join(dir, "k")) // relu, pas recréé
-	if st, _ := os.Stat(filepath.Join(dir, "k")); st.Mode().Perm() != 0o600 || !bytes.Equal(k1, k2) {
+	if st, _ := os.Stat(filepath.Join(dir, "k")); (runtime.GOOS != "windows" && st.Mode().Perm() != 0o600) || !bytes.Equal(k1, k2) {
 		t.Fatalf("clé non persistée ou permissions %v", st.Mode().Perm())
 	}
 	a, b, c := NewVault(""), NewVault(""), NewVault("")
