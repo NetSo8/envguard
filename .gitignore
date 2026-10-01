@@ -2,3 +2,4 @@ envguard
 .envguard_allow
 *.test
 .claude/
+dist/
