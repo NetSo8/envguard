@@ -1,3 +1,4 @@
 envguard
 .envguard_allow
 *.test
+.claude/

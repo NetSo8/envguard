@@ -91,7 +91,7 @@ func TestEnvSecretMaskedEverywhere(t *testing.T) {
 	}
 	body := []byte(`{"text":"le code compare avec k8#Zq2!vLm9@pXr4 et appelle sk` + `_live_51HxQ2bKz8Lm4Np6Rq en development, mot de passe Zq8vLm2pXr9T sur db.internal"}`)
 	out, _ := v.Mask(body)
-	if bytes.Contains(out, []byte("k8#Zq2!vLm9@pXr4")) || bytes.Contains(out, []byte("sk" + "_live_51HxQ2bKz8Lm4Np6Rq")) ||
+	if bytes.Contains(out, []byte("k8#Zq2!vLm9@pXr4")) || bytes.Contains(out, []byte("sk"+"_live_51HxQ2bKz8Lm4Np6Rq")) ||
 		bytes.Contains(out, []byte("Zq8vLm2pXr9T")) || !bytes.Contains(out, []byte("db.internal")) {
 		t.Fatalf("secret du .env non masqué : %s", out)
 	}
