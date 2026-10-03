@@ -805,3 +805,98 @@ func shortenPath(p string) string {
 	}
 	return p
 }
+
+// wrapServerByName recherche le serveur targetName dans la config et lui applique wrapServer.
+func wrapServerByName(root map[string]any, targetName, binName string) bool {
+	if mcpServers, ok := root["mcpServers"]; ok {
+		if m, ok := mcpServers.(map[string]any); ok {
+			if srv, ok := m[targetName].(map[string]any); ok {
+				return wrapServer(srv, binName)
+			}
+		}
+	}
+	if mcp, ok := root["mcp"]; ok {
+		if m, ok := mcp.(map[string]any); ok {
+			if srv, ok := m[targetName].(map[string]any); ok {
+				return wrapServer(srv, binName)
+			}
+		}
+	}
+	if ctx, ok := root["context_servers"]; ok {
+		if m, ok := ctx.(map[string]any); ok {
+			if srv, ok := m[targetName].(map[string]any); ok {
+				return wrapServer(srv, binName)
+			}
+		}
+	}
+	return false
+}
+
+// unwrapServerByName recherche le serveur targetName dans la config et lui applique unwrapServer.
+func unwrapServerByName(root map[string]any, targetName string) bool {
+	if mcpServers, ok := root["mcpServers"]; ok {
+		if m, ok := mcpServers.(map[string]any); ok {
+			if srv, ok := m[targetName].(map[string]any); ok {
+				return unwrapServer(srv)
+			}
+		}
+	}
+	if mcp, ok := root["mcp"]; ok {
+		if m, ok := mcp.(map[string]any); ok {
+			if srv, ok := m[targetName].(map[string]any); ok {
+				return unwrapServer(srv)
+			}
+		}
+	}
+	if ctx, ok := root["context_servers"]; ok {
+		if m, ok := ctx.(map[string]any); ok {
+			if srv, ok := m[targetName].(map[string]any); ok {
+				return unwrapServer(srv)
+			}
+		}
+	}
+	return false
+}
+
+// toggleSingleServer bascule l'état de protection d'un unique serveur MCP dans son fichier.
+func toggleSingleServer(path, toolName, serverName string) (bool, error) {
+	disc, err := parseMCPConfigFile(path, toolName)
+	if err != nil {
+		return false, err
+	}
+	var isProt bool
+	found := false
+	for _, s := range disc.Servers {
+		if s.Name == serverName {
+			isProt = s.Protected
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false, fmt.Errorf("serveur %s non trouvé dans %s", serverName, path)
+	}
+
+	bin := resolveBinName("")
+	if isProt {
+		if !unwrapServerByName(disc.Raw, serverName) {
+			return false, fmt.Errorf("impossible de déprotéger %s", serverName)
+		}
+	} else {
+		backupFile(path)
+		if !wrapServerByName(disc.Raw, serverName, bin) {
+			return false, fmt.Errorf("impossible de protéger %s", serverName)
+		}
+	}
+
+	data, err := json.MarshalIndent(disc.Raw, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return false, err
+	}
+	return !isProt, nil
+}
+

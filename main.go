@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-isatty"
 )
 
 // options : configuration commune à « envguard » et « envguard run ».
@@ -159,6 +159,8 @@ func logEvent(w io.Writer, e Event) {
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "menu":
+			os.Exit(menuCmd(os.Args[2:]))
 		case "run":
 			os.Exit(runCmd(os.Args[2:]))
 		case "mcp":
@@ -169,24 +171,41 @@ func main() {
 			os.Exit(mcpUnprotectCmd(os.Args[2:]))
 		case "status":
 			os.Exit(mcpStatusCmd(os.Args[2:]))
+		case "proxy":
+			os.Exit(runProxy(os.Args[2:]))
 		}
 	}
+
+	// Si aucun argument n'est fourni et que le terminal est interactif (TTY),
+	// on affiche le centre de contrôle interactif (menu) par défaut.
+	if len(os.Args) == 1 && (isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())) {
+		os.Exit(menuCmd(nil))
+	}
+
+	os.Exit(runProxy(os.Args[1:]))
+}
+
+func runProxy(args []string) int {
 	o := options{listen: "127.0.0.1:8787"}
 	fs := newFlags("envguard", &o)
 	fs.BoolVar(&o.noTUI, "no-tui", false, "mode headless (logs sur stderr)")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage :\n  envguard [options]              proxy + TUI\n  envguard run [options] -- cmd   lance cmd derrière le proxy\n  envguard mcp [options] -- cmd   proxy stdio pour serveur MCP\n  envguard protect [options]      sécurise automatiquement tous les serveurs MCP (Cursor, Claude, Trae, JetBrains…)\n  envguard unprotect              restaure les configurations MCP d'origine\n  envguard status                 affiche l'état des serveurs MCP détectés\n\nOptions :\n")
+		fmt.Fprintf(fs.Output(), "Usage :\n  envguard                        centre de contrôle interactif (menu)\n  envguard proxy [options]        proxy HTTP + TUI\n  envguard menu                   ouvrir le menu interactif\n  envguard run [options] -- cmd   lance cmd derrière le proxy\n  envguard mcp [options] -- cmd   proxy stdio pour serveur MCP\n  envguard protect [options]      sécurise automatiquement tous les serveurs MCP (Cursor, Claude, Trae, JetBrains…)\n  envguard unprotect              restaure les configurations MCP d'origine\n  envguard status                 affiche l'état des serveurs MCP détectés\n\nOptions :\n")
 		fs.PrintDefaults()
 	}
-	fs.Parse(os.Args[1:])
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	p, envPaths, err := setup(&o)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Fprintln(os.Stderr, "envguard :", err)
+		return 1
 	}
 	ln, err := net.Listen("tcp", o.listen)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Fprintln(os.Stderr, "envguard :", err)
+		return 1
 	}
 	serve(p, ln)
 
@@ -204,11 +223,13 @@ func main() {
 		for e := range p.events {
 			logEvent(os.Stderr, e)
 		}
-		return
+		return 0
 	}
 	if _, err := tea.NewProgram(&model{p: p, listen: o.listen}, tea.WithAltScreen()).Run(); err != nil {
-		log.Fatal(err)
+		fmt.Fprintln(os.Stderr, "envguard :", err)
+		return 1
 	}
+	return 0
 }
 
 // originsFlag : -allow-origin répétable.

@@ -19,20 +19,34 @@ type logRow struct {
 
 type secretRow struct{ rule, secret, ph string }
 
+type mcpRow struct {
+	toolName  string
+	path      string
+	name      string
+	command   string
+	protected bool
+	remote    bool
+}
+
 type model struct {
-	p       *Proxy
-	listen  string
-	logs    [logCap]logRow // ring buffer fixe : pas de croissance, pas de GC
-	head, n int
-	secrets []secretRow
-	cur     int
-	tab     int
-	reqs    int
-	masked  int
-	rehyd   int
-	blocked int
-	lat     time.Duration
-	w, h    int
+	p            *Proxy
+	listen       string
+	logs         [logCap]logRow // ring buffer fixe : pas de croissance, pas de GC
+	head, n      int
+	secrets      []secretRow
+	cur          int
+	tab          int
+	reqs         int
+	masked       int
+	rehyd        int
+	blocked      int
+	lat          time.Duration
+	w, h         int
+	mcpRows      []mcpRow
+	mcpCur       int
+	mcpNote      string
+	mcpProtected int
+	mcpTotal     int
 }
 
 type evMsg Event
@@ -67,7 +81,39 @@ var (
 
 func wait(ch <-chan Event) tea.Cmd { return func() tea.Msg { return evMsg(<-ch) } }
 
-func (m *model) Init() tea.Cmd { return wait(m.p.events) }
+func (m *model) Init() tea.Cmd {
+	m.refreshMCP()
+	return wait(m.p.events)
+}
+
+func (m *model) refreshMCP() {
+	files, _ := discoverConfigs(nil)
+	var rows []mcpRow
+	prot := 0
+	tot := 0
+	for _, f := range files {
+		for _, s := range f.Servers {
+			tot++
+			if s.Protected {
+				prot++
+			}
+			rows = append(rows, mcpRow{
+				toolName:  f.ToolName,
+				path:      f.Path,
+				name:      s.Name,
+				command:   s.Command,
+				protected: s.Protected,
+				remote:    s.Remote,
+			})
+		}
+	}
+	m.mcpRows = rows
+	m.mcpProtected = prot
+	m.mcpTotal = tot
+	if m.mcpCur >= len(m.mcpRows) && len(m.mcpRows) > 0 {
+		m.mcpCur = len(m.mcpRows) - 1
+	}
+}
 
 func (m *model) push(r logRow) {
 	r.at = time.Now()
@@ -109,18 +155,84 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "tab", "1", "2":
-			m.tab ^= 1
+		case "tab":
+			m.tab = (m.tab + 1) % 3
+		case "1":
+			m.tab = 0
+		case "2":
+			m.tab = 1
+		case "3", "m":
+			m.tab = 2
 		case "j", "down":
-			if m.cur < len(m.secrets)-1 {
-				m.cur++
+			if m.tab == 1 {
+				if m.cur < len(m.secrets)-1 {
+					m.cur++
+				}
+			} else if m.tab == 2 {
+				if m.mcpCur < len(m.mcpRows)-1 {
+					m.mcpCur++
+				}
 			}
 		case "k", "up":
-			if m.cur > 0 {
-				m.cur--
+			if m.tab == 1 {
+				if m.cur > 0 {
+					m.cur--
+				}
+			} else if m.tab == 2 {
+				if m.mcpCur > 0 {
+					m.mcpCur--
+				}
 			}
-		case "p", " ":
-			m.p.v.SetPaused(!m.p.v.paused.Load())
+		case "p":
+			if m.tab == 2 {
+				if m.mcpCur < len(m.mcpRows) {
+					row := m.mcpRows[m.mcpCur]
+					if !row.remote {
+						newState, err := toggleSingleServer(row.path, row.toolName, row.name)
+						if err == nil {
+							m.refreshMCP()
+							if newState {
+								m.mcpNote = "✓ " + row.name + " sécurisé par envguard !"
+							} else {
+								m.mcpNote = "✓ " + row.name + " rétabli à l'original !"
+							}
+						}
+					}
+				}
+			} else {
+				m.p.v.SetPaused(!m.p.v.paused.Load())
+			}
+		case " ", "enter":
+			if m.tab == 2 {
+				if m.mcpCur < len(m.mcpRows) {
+					row := m.mcpRows[m.mcpCur]
+					if !row.remote {
+						newState, err := toggleSingleServer(row.path, row.toolName, row.name)
+						if err == nil {
+							m.refreshMCP()
+							if newState {
+								m.mcpNote = "✓ " + row.name + " sécurisé par envguard !"
+							} else {
+								m.mcpNote = "✓ " + row.name + " rétabli à l'original !"
+							}
+						}
+					}
+				}
+			} else {
+				m.p.v.SetPaused(!m.p.v.paused.Load())
+			}
+		case "P":
+			if m.tab == 2 {
+				mcpProtectCmd(nil)
+				m.refreshMCP()
+				m.mcpNote = "✅ Tous les serveurs MCP ont été protégés !"
+			}
+		case "u":
+			if m.tab == 2 {
+				mcpUnprotectCmd(nil)
+				m.refreshMCP()
+				m.mcpNote = "✅ Toutes les commandes originales ont été restaurées !"
+			}
 		case "a":
 			if m.tab == 1 && m.cur < len(m.secrets) {
 				s := m.secrets[m.cur]
@@ -134,6 +246,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *model) mcpCardVal() string {
+	if m.mcpTotal == 0 {
+		return "aucun"
+	}
+	if m.mcpProtected == m.mcpTotal {
+		return fmt.Sprintf("%d prot.", m.mcpProtected)
+	}
+	return fmt.Sprintf("%d/%d prot.", m.mcpProtected, m.mcpTotal)
+}
+
+func (m *model) mcpCardColor() lipgloss.Color {
+	if m.mcpTotal == 0 {
+		return cMuted
+	}
+	if m.mcpProtected == m.mcpTotal {
+		return cOK
+	}
+	return cWarn
 }
 
 func (m *model) View() string {
@@ -163,32 +295,76 @@ func (m *model) View() string {
 		card("masqués", fmt.Sprint(m.masked), cAccent),
 		card("réhydratés", rehydLabel(m.rehyd, m.blocked), rehydColor(m.blocked)),
 		card("latence moy.", avg, lipgloss.Color("#E5E7EB")),
+		card("serveurs MCP", m.mcpCardVal(), m.mcpCardColor()),
 	}
 	stats := lipgloss.JoinHorizontal(lipgloss.Top, cards...)
 
 	// Onglets
-	t0, t1 := sTabOff.Render("Activité"), sTabOff.Render(fmt.Sprintf("Secrets (%d)", len(m.secrets)))
+	t0, t1, t2 := sTabOff.Render("Activité"), sTabOff.Render(fmt.Sprintf("Secrets (%d)", len(m.secrets))), sTabOff.Render(fmt.Sprintf("Serveurs MCP (%d/%d)", m.mcpProtected, m.mcpTotal))
 	if m.tab == 0 {
 		t0 = sTabOn.Render("Activité")
-	} else {
+	} else if m.tab == 1 {
 		t1 = sTabOn.Render(fmt.Sprintf("Secrets (%d)", len(m.secrets)))
+	} else {
+		t2 = sTabOn.Render(fmt.Sprintf("Serveurs MCP (%d/%d)", m.mcpProtected, m.mcpTotal))
 	}
-	tabs := lipgloss.JoinHorizontal(lipgloss.Bottom, t0, " ", t1)
+	tabs := lipgloss.JoinHorizontal(lipgloss.Bottom, t0, " ", t1, " ", t2)
 
 	rows := m.h - lipgloss.Height(header) - lipgloss.Height(stats) - lipgloss.Height(tabs) - 4
 	rows = max(rows, 3)
 	var body string
-	if m.tab == 0 {
+	switch m.tab {
+	case 0:
 		body = m.viewLog(rows)
-	} else {
+	case 1:
 		body = m.viewSecrets(rows)
+	case 2:
+		body = m.viewMCP(rows)
 	}
 
-	help := helpLine([][2]string{{"tab", "onglet"}, {"↑↓", "naviguer"}, {"a", "allowlist"}, {"p", "pause"}, {"q", "quitter"}})
+	var help string
+	switch m.tab {
+	case 0:
+		help = helpLine([][2]string{{"tab/1-3", "onglet"}, {"p", "pause"}, {"q", "quitter"}})
+	case 1:
+		help = helpLine([][2]string{{"tab/1-3", "onglet"}, {"↑↓", "naviguer"}, {"a", "allowlist"}, {"q", "quitter"}})
+	case 2:
+		help = helpLine([][2]string{{"tab/1-3", "onglet"}, {"↑↓", "naviguer"}, {"espace/p", "basculer"}, {"P", "tout protéger"}, {"u", "rétablir"}, {"q", "quitter"}})
+	}
 
 	return lipgloss.NewStyle().Padding(0, 1).Render(lipgloss.JoinVertical(lipgloss.Left,
 		header, "", stats, "", tabs, lipgloss.NewStyle().Height(rows).Render(body), "", help))
 }
+
+func (m *model) viewMCP(rows int) string {
+	if len(m.mcpRows) == 0 {
+		return sMuted.Render("Aucun serveur MCP détecté sur cette machine.\nPour protéger un fichier : envguard protect ./mon-fichier-mcp.json")
+	}
+	var b strings.Builder
+	if m.mcpNote != "" {
+		b.WriteString(lipgloss.NewStyle().Foreground(cOK).Bold(true).Render(m.mcpNote) + "\n\n")
+	}
+	b.WriteString(sMuted.Render(fmt.Sprintf("  %-22s %-20s %-12s %s", "SERVEUR", "OUTIL / IDE", "COMMANDE", "STATUT")) + "\n")
+	start := max(0, m.mcpCur-rows+2)
+	for i := start; i < len(m.mcpRows) && i < start+rows-1; i++ {
+		row := m.mcpRows[i]
+		stStr := lipgloss.NewStyle().Foreground(cOK).Render("🛡️  PROTÉGÉ")
+		if row.remote {
+			stStr = sMuted.Render("• distant")
+		} else if !row.protected {
+			stStr = lipgloss.NewStyle().Foreground(cWarn).Bold(true).Render("⚠️  NON PROTÉGÉ")
+		}
+		line := fmt.Sprintf("%-22s %-20s %-12s %s", truncate(row.name, 21), truncate(row.toolName, 19), truncate(row.command, 11), stStr)
+		if i == m.mcpCur {
+			b.WriteString(sSel.Render("› " + line))
+		} else {
+			b.WriteString("  " + line)
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 
 func card(label, val string, c lipgloss.Color) string {
 	return sCard.Render(sMuted.Render(label) + "\n" + sNum.Foreground(c).Render(val))

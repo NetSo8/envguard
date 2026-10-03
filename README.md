@@ -51,14 +51,26 @@ Nécessite Go 1.27 ou plus récent.
 
 ## Démarrage rapide
 
-**Avec un agent** : envguard lance l'outil derrière lui et s'arrête avec lui.
+### 🎮 Centre de Contrôle Interactif (Menu)
+
+Tapez simplement `envguard` dans votre terminal pour ouvrir le menu interactif :
+
+```bash
+envguard
+```
+
+Depuis ce menu, vous pouvez :
+- **Lancer le Proxy HTTP & Dashboard** en 1 touche ([Entrée])
+- **Gérer et basculer la protection MCP** de tous vos IDEs (Cursor, Claude, Trae, JetBrains…) avec la barre d'espace
+- **Lancer un agent IA sous protection** (`claude`, `aider`, `cursor .`, etc.)
+- **Auditer les secrets** détectés dans les `.env` du dossier courant
+
+### ⚡ Avec un agent en ligne de commande
+
+`envguard` lance l'outil derrière lui et s'arrête avec lui :
 
 ```bash
 envguard run -- claude
-```
-
-```bash
-envguard run -- codex
 ```
 
 - **Variables d'environnement :** l'outil reçoit `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_BASE` et `GOOGLE_GEMINI_BASE_URL`, pointées vers un proxy sur un port libre.
@@ -66,10 +78,10 @@ envguard run -- codex
 - **À la sortie :** un résumé s'affiche, réhydratations bloquées comprises. Le journal va dans `<config>/envguard/run.log`, sans jamais écrire de secret.
 - **Code de sortie :** celui de l'outil est transmis.
 
-**En proxy permanent, avec la TUI :**
+### 🌐 Lancer directement le Proxy HTTP permanent & Dashboard TUI
 
 ```bash
-envguard
+envguard proxy
 ```
 
 Il écoute alors sur `127.0.0.1:8787`, avec une route par fournisseur :
@@ -77,6 +89,11 @@ Il écoute alors sur `127.0.0.1:8787`, avec une route par fournisseur :
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic claude
 ```
+
+Le dashboard TUI comprend 3 onglets navigables (`tab` ou `1`, `2`, `3`) :
+1. **Activité :** flux des requêtes en direct, débit, masquages et réhydratations.
+2. **Secrets :** liste des secrets identifiés et gestion de l'allowlist (`a`).
+3. **Serveurs MCP :** état de chaque serveur MCP détecté dans vos IDEs, avec bascule 1-clic (`espace`), protection complète (`P`) et restauration (`u`).
 
 Chaque fournisseur dispose de sa propre route (`/anthropic`, `/openai`, `/gemini`, etc.).
 
