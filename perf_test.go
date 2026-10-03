@@ -376,3 +376,58 @@ func BenchmarkPolicyRehydrateTool(b *testing.B) {
 		}
 	})
 }
+
+func BenchmarkMCPFilter(b *testing.B) {
+	v := NewVault("")
+	v.Mask([]byte(key))
+	ph := v.Placeholder("sk-ant-", key)
+	pol, _ := parsePolicy("strict", nil)
+
+	cleanServerMsg := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"Database healthy, 42 rows selected"}]}}` + "\n")
+	secretServerMsg := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"User token: ` + key + `"}]}}` + "\n")
+
+	cleanClientMsg := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}` + "\n")
+	rehydrateClientMsg := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT * FROM t WHERE k='` + ph + `'"}}}` + "\n")
+
+	const count = 500
+	cleanServerStream := bytes.Repeat(cleanServerMsg, count)
+	secretServerStream := bytes.Repeat(secretServerMsg, count)
+	cleanClientStream := bytes.Repeat(cleanClientMsg, count)
+	rehydrateClientStream := bytes.Repeat(rehydrateClientMsg, count)
+
+	b.Run("server-clean-stream", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(cleanServerStream)))
+		for b.Loop() {
+			filterChildToClient(bytes.NewReader(cleanServerStream), io.Discard, v)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*count), "ns/msg")
+	})
+
+	b.Run("server-with-secret-stream", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(secretServerStream)))
+		for b.Loop() {
+			filterChildToClient(bytes.NewReader(secretServerStream), io.Discard, v)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*count), "ns/msg")
+	})
+
+	b.Run("client-clean-stream", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(cleanClientStream)))
+		for b.Loop() {
+			filterClientToChild(bytes.NewReader(cleanClientStream), io.Discard, v, pol, nil)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*count), "ns/msg")
+	})
+
+	b.Run("client-rehydrate-stream", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(rehydrateClientStream)))
+		for b.Loop() {
+			filterClientToChild(bytes.NewReader(rehydrateClientStream), io.Discard, v, pol, nil)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*count), "ns/msg")
+	})
+}

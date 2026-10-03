@@ -80,6 +80,29 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic claude
 
 Chaque fournisseur dispose de sa propre route (`/anthropic`, `/openai`, `/gemini`, etc.).
 
+**Pour un serveur MCP (Model Context Protocol) :** envguard s'intercale sur stdio (JSON-RPC) pour filtrer les sorties des outils (bases de données, fichiers, fetch...) et sécuriser les entrées :
+
+```bash
+envguard mcp -- npx @modelcontextprotocol/server-postgres "postgresql://localhost/mydb"
+```
+
+Dans la configuration MCP de votre agent (`claude_desktop_config.json`, `.mcp.json` pour Cursor ou Claude Code) :
+
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "envguard",
+      "args": ["mcp", "--", "npx", "-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"]
+    }
+  }
+}
+```
+
+- **Sorties masquées :** chaque ligne ou secret renvoyé par un outil MCP est remplacé par un placeholder avant d'entrer dans le contexte de l'agent.
+- **Entrées protégées :** la politique d'appels d'outils (blocage d'exfiltration réseau et protection des fichiers) s'applique aux arguments transmis au serveur MCP.
+- **Journal :** écrit dans `<config>/envguard/mcp.log` (stdout restant réservé aux messages JSON-RPC du protocole).
+
 ## Comment ça marche
 
 1. **Requête** : le corps JSON est scanné en un passage, sans expression régulière pour les règles natives. Les secrets trouvés reçoivent un placeholder qui garde leur préfixe (`sk-ant-REDACTED_3c93161e`), dérivé d'un HMAC avec une clé locale. Une consigne ajoutée au system prompt demande au modèle de recopier les placeholders tels quels.
@@ -175,7 +198,7 @@ Un appel à un modèle dure de 1 à 60 secondes : le surcoût est imperceptible.
 
 ## Options
 
-Toutes les options s'appliquent à `envguard` comme à `envguard run`.
+Toutes les options s'appliquent à `envguard`, `envguard run` et `envguard mcp`.
 
 | Option | Défaut | Rôle |
 |---|---|---|
@@ -192,7 +215,7 @@ Toutes les options s'appliquent à `envguard` comme à `envguard run`.
 | `-key` | `<config>/envguard/key` | clé qui dérive les placeholders (créée au premier lancement, `0600`) |
 | `-allow-origin URL` | — | origine navigateur autorisée, ex. `http://localhost:3000` (répétable) |
 | `-max-body` | `268435456` | taille max d'un corps de requête, en octets |
-| `-log` | `<config>/envguard/run.log` | journal de `envguard run` |
+| `-log` | `<config>/envguard/run.log` (`mcp` : `mcp.log`) | journal d'exécution |
 | `-no-hint` | `false` | n'injecte pas la consigne « recopie les placeholders tels quels » |
 | `-no-tui` | `false` | logs sur stderr au lieu de la TUI |
 

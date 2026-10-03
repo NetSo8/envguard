@@ -60,28 +60,47 @@ func newFlags(name string, o *options) *flag.FlagSet {
 	return fs
 }
 
-// setup construit le vault et le proxy à partir des options.
-func setup(o *options) (*Proxy, []string, error) {
-	provs, err := parseProviders(o.provs)
-	if err != nil {
-		return nil, nil, err
-	}
+// setupVault construit le vault et la politique à partir des options.
+func setupVault(o *options) (*Vault, *Policy, []string, error) {
 	pol, err := parsePolicy(o.toolPolicy, o.allowHosts)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	pol.noFile = o.noFileGuard
 	key, err := LoadKey(o.keyFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("clé %s : %v", o.keyFile, err)
+		return nil, nil, nil, fmt.Errorf("clé %s : %v", o.keyFile, err)
 	}
 	v := NewVault("")
 	v.SetKey(key)
 	v.LoadAllow(o.allow) // après la clé : l'allowlist est stockée en HMAC
 	if !o.noGL {
 		if v.gl, err = loadGitleaks(append(append([]string(nil), gitleaksDefaultExclude...), o.glExclude...)); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
+	}
+
+	paths := []string(o.envFiles)
+	if len(paths) == 0 && !o.noEnv {
+		paths = envFiles(".")
+	}
+	for _, f := range paths {
+		if _, err := v.loadEnvFile(f); err != nil {
+			return nil, nil, nil, fmt.Errorf("fichier .env %s : %v", f, err)
+		}
+	}
+	return v, pol, paths, nil
+}
+
+// setup construit le vault et le proxy à partir des options.
+func setup(o *options) (*Proxy, []string, error) {
+	provs, err := parseProviders(o.provs)
+	if err != nil {
+		return nil, nil, err
+	}
+	v, pol, paths, err := setupVault(o)
+	if err != nil {
+		return nil, nil, err
 	}
 	host, _, _ := net.SplitHostPort(o.listen)
 	p := &Proxy{
@@ -104,16 +123,6 @@ func setup(o *options) (*Proxy, []string, error) {
 	}
 	v.onNew = func(kind, secret, ph string) { p.emit(Event{Kind: evSecret, Rule: kind, Secret: secret, Ph: ph}) }
 
-	// Fichiers .env : chargés avant la première requête, puis surveillés.
-	paths := []string(o.envFiles)
-	if len(paths) == 0 && !o.noEnv {
-		paths = envFiles(".")
-	}
-	for _, f := range paths {
-		if _, err := v.loadEnvFile(f); err != nil {
-			return nil, nil, fmt.Errorf("fichier .env %s : %v", f, err)
-		}
-	}
 	if len(paths) > 0 {
 		go v.watchEnvFiles(paths, 2*time.Second, func(f string, err error) {
 			p.emit(Event{Kind: evErr, Path: f, Rule: err.Error()})
@@ -151,11 +160,14 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "run" {
 		os.Exit(runCmd(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		os.Exit(mcpCmd(os.Args[2:]))
+	}
 	o := options{listen: "127.0.0.1:8787"}
 	fs := newFlags("envguard", &o)
 	fs.BoolVar(&o.noTUI, "no-tui", false, "mode headless (logs sur stderr)")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage :\n  envguard [options]              proxy + TUI\n  envguard run [options] -- cmd   lance cmd derrière le proxy\n\nOptions :\n")
+		fmt.Fprintf(fs.Output(), "Usage :\n  envguard [options]              proxy + TUI\n  envguard run [options] -- cmd   lance cmd derrière le proxy\n  envguard mcp [options] -- cmd   proxy stdio pour serveur MCP\n\nOptions :\n")
 		fs.PrintDefaults()
 	}
 	fs.Parse(os.Args[1:])
