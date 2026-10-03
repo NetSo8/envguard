@@ -100,16 +100,3 @@ func TestMenuMCPToggle(t *testing.T) {
 		t.Fatalf("Le serveur devait être rétabli : %s", string(contentAfter))
 	}
 }
-
-func containsStr(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(sub) == 0 || (len(s) > 0 && filepath.Base(s) != "" && stringContains(s, sub)))
-}
-
-func stringContains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}

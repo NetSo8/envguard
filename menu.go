@@ -58,21 +58,7 @@ func newMenuModel() *menuModel {
 }
 
 func (m *menuModel) refreshMCP() {
-	files, _ := discoverConfigs(nil)
-	var rows []mcpRow
-	for _, f := range files {
-		for _, s := range f.Servers {
-			rows = append(rows, mcpRow{
-				toolName:  f.ToolName,
-				path:      f.Path,
-				name:      s.Name,
-				command:   s.Command,
-				protected: s.Protected,
-				remote:    s.Remote,
-			})
-		}
-	}
-	m.mcpItems = rows
+	m.mcpItems, _, _ = discoverMCPRows()
 	if m.mcpCur >= len(m.mcpItems) && len(m.mcpItems) > 0 {
 		m.mcpCur = len(m.mcpItems) - 1
 	}

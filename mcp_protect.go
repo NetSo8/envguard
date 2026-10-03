@@ -806,54 +806,66 @@ func shortenPath(p string) string {
 	return p
 }
 
+type mcpRow struct {
+	toolName  string
+	path      string
+	name      string
+	command   string
+	protected bool
+	remote    bool
+}
+
+// discoverMCPRows analyse l'ensemble des configurations MCP et renvoie
+// la liste plate des serveurs, le nombre de serveurs protégés et le total de serveurs locaux.
+func discoverMCPRows() ([]mcpRow, int, int) {
+	files, _ := discoverConfigs(nil)
+	var rows []mcpRow
+	prot, tot := 0, 0
+	for _, f := range files {
+		for _, s := range f.Servers {
+			if !s.Remote {
+				tot++
+				if s.Protected {
+					prot++
+				}
+			}
+			rows = append(rows, mcpRow{
+				toolName:  f.ToolName,
+				path:      f.Path,
+				name:      s.Name,
+				command:   s.Command,
+				protected: s.Protected,
+				remote:    s.Remote,
+			})
+		}
+	}
+	return rows, prot, tot
+}
+
+// findServerMap localise le dictionnaire d'un serveur par nom dans la structure JSON.
+func findServerMap(root map[string]any, targetName string) map[string]any {
+	for _, key := range []string{"mcpServers", "mcp", "context_servers"} {
+		if sec, ok := root[key].(map[string]any); ok {
+			if srv, ok := sec[targetName].(map[string]any); ok {
+				return srv
+			}
+		}
+	}
+	return nil
+}
+
 // wrapServerByName recherche le serveur targetName dans la config et lui applique wrapServer.
 func wrapServerByName(root map[string]any, targetName, binName string) bool {
-	if mcpServers, ok := root["mcpServers"]; ok {
-		if m, ok := mcpServers.(map[string]any); ok {
-			if srv, ok := m[targetName].(map[string]any); ok {
-				return wrapServer(srv, binName)
-			}
-		}
-	}
-	if mcp, ok := root["mcp"]; ok {
-		if m, ok := mcp.(map[string]any); ok {
-			if srv, ok := m[targetName].(map[string]any); ok {
-				return wrapServer(srv, binName)
-			}
-		}
-	}
-	if ctx, ok := root["context_servers"]; ok {
-		if m, ok := ctx.(map[string]any); ok {
-			if srv, ok := m[targetName].(map[string]any); ok {
-				return wrapServer(srv, binName)
-			}
-		}
+	if srv := findServerMap(root, targetName); srv != nil {
+		return wrapServer(srv, binName)
 	}
 	return false
 }
 
 // unwrapServerByName recherche le serveur targetName dans la config et lui applique unwrapServer.
 func unwrapServerByName(root map[string]any, targetName string) bool {
-	if mcpServers, ok := root["mcpServers"]; ok {
-		if m, ok := mcpServers.(map[string]any); ok {
-			if srv, ok := m[targetName].(map[string]any); ok {
-				return unwrapServer(srv)
-			}
-		}
-	}
-	if mcp, ok := root["mcp"]; ok {
-		if m, ok := mcp.(map[string]any); ok {
-			if srv, ok := m[targetName].(map[string]any); ok {
-				return unwrapServer(srv)
-			}
-		}
-	}
-	if ctx, ok := root["context_servers"]; ok {
-		if m, ok := ctx.(map[string]any); ok {
-			if srv, ok := m[targetName].(map[string]any); ok {
-				return unwrapServer(srv)
-			}
-		}
+	if srv := findServerMap(root, targetName); srv != nil {
+		return unwrapServer(srv)
 	}
 	return false
 }

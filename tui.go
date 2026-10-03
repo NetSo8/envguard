@@ -19,15 +19,6 @@ type logRow struct {
 
 type secretRow struct{ rule, secret, ph string }
 
-type mcpRow struct {
-	toolName  string
-	path      string
-	name      string
-	command   string
-	protected bool
-	remote    bool
-}
-
 type model struct {
 	p            *Proxy
 	listen       string
@@ -87,29 +78,7 @@ func (m *model) Init() tea.Cmd {
 }
 
 func (m *model) refreshMCP() {
-	files, _ := discoverConfigs(nil)
-	var rows []mcpRow
-	prot := 0
-	tot := 0
-	for _, f := range files {
-		for _, s := range f.Servers {
-			tot++
-			if s.Protected {
-				prot++
-			}
-			rows = append(rows, mcpRow{
-				toolName:  f.ToolName,
-				path:      f.Path,
-				name:      s.Name,
-				command:   s.Command,
-				protected: s.Protected,
-				remote:    s.Remote,
-			})
-		}
-	}
-	m.mcpRows = rows
-	m.mcpProtected = prot
-	m.mcpTotal = tot
+	m.mcpRows, m.mcpProtected, m.mcpTotal = discoverMCPRows()
 	if m.mcpCur >= len(m.mcpRows) && len(m.mcpRows) > 0 {
 		m.mcpCur = len(m.mcpRows) - 1
 	}
