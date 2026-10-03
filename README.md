@@ -86,7 +86,39 @@ Chaque fournisseur dispose de sa propre route (`/anthropic`, `/openai`, `/gemini
 envguard mcp -- npx @modelcontextprotocol/server-postgres "postgresql://localhost/mydb"
 ```
 
-Dans la configuration MCP de votre agent (`claude_desktop_config.json`, `.mcp.json` pour Cursor ou Claude Code) :
+### ⚡ Protection automatique en un clic (`envguard protect`)
+
+Pour les développeurs qui ne veulent pas éditer manuellement des fichiers JSON enfouis dans le système :
+
+```bash
+# Détecte et sécurise automatiquement tous vos serveurs MCP existants
+envguard protect
+
+# Voir l'état de protection sans rien modifier
+envguard status
+
+# Revenir aux configurations d'origine à tout moment
+envguard unprotect
+```
+
+`envguard protect` scanne et sécurise instantanément les configurations de :
+- **Cursor** (`~/.cursor/mcp.json`, `.cursor/mcp.json`)
+- **Claude Desktop** (`claude_desktop_config.json`)
+- **Claude Code** (`~/.claude.json`, `.claude.json`)
+- **Trae** (ByteDance : `~/.trae/mcp.json`, `.trae/mcp.json`)
+- **Tous les IDE JetBrains** (IntelliJ, PyCharm, WebStorm, GoLand, CLion, Rider, RustRover, Fleet : `.idea/mcp.json`, `options`)
+- **Google Antigravity** (`~/.gemini/config/mcp_config.json`, `~/.antigravity/mcp.json`)
+- **OpenCode** (`~/.config/opencode/opencode.jsonc`, `opencode.json`)
+- **Windsurf** (`~/.codeium/windsurf/mcp_config.json`, `.windsurf/mcp.json`)
+- **VS Code & Extensions** (Cline, Roo Code, Continue, Copilot MCP)
+- **Zed** (`~/.config/zed/settings.json`)
+- **Projets locaux** (`.mcp.json`, `mcp.json`)
+
+Une sauvegarde automatique `.envguard.bak` de chaque fichier est créée avant toute modification.
+
+### Configuration manuelle
+
+Si vous préférez configurer votre client manuellement (`claude_desktop_config.json` ou `.mcp.json`) :
 
 ```json
 {
@@ -99,9 +131,9 @@ Dans la configuration MCP de votre agent (`claude_desktop_config.json`, `.mcp.js
 }
 ```
 
-- **Sorties masquées :** chaque ligne ou secret renvoyé par un outil MCP est remplacé par un placeholder avant d'entrer dans le contexte de l'agent.
-- **Entrées protégées :** la politique d'appels d'outils (blocage d'exfiltration réseau et protection des fichiers) s'applique aux arguments transmis au serveur MCP.
-- **Journal :** écrit dans `<config>/envguard/mcp.log` (stdout restant réservé aux messages JSON-RPC du protocole).
+- **Sorties masquées :** chaque secret renvoyé par un outil MCP est masqué par un placeholder HMAC avant d'entrer dans le contexte de l'agent.
+- **Entrées protégées :** la politique d'appels d'outils (blocage d'exfiltration réseau et protection des fichiers source) s'applique aux arguments transmis au serveur.
+- **Journal :** écrit dans `<config>/envguard/mcp.log` (stdout restant strictement réservé aux messages JSON-RPC du protocole).
 
 ## Comment ça marche
 

@@ -157,17 +157,25 @@ func logEvent(w io.Writer, e Event) {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "run" {
-		os.Exit(runCmd(os.Args[2:]))
-	}
-	if len(os.Args) > 1 && os.Args[1] == "mcp" {
-		os.Exit(mcpCmd(os.Args[2:]))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "run":
+			os.Exit(runCmd(os.Args[2:]))
+		case "mcp":
+			os.Exit(mcpCmd(os.Args[2:]))
+		case "protect":
+			os.Exit(mcpProtectCmd(os.Args[2:]))
+		case "unprotect":
+			os.Exit(mcpUnprotectCmd(os.Args[2:]))
+		case "status":
+			os.Exit(mcpStatusCmd(os.Args[2:]))
+		}
 	}
 	o := options{listen: "127.0.0.1:8787"}
 	fs := newFlags("envguard", &o)
 	fs.BoolVar(&o.noTUI, "no-tui", false, "mode headless (logs sur stderr)")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage :\n  envguard [options]              proxy + TUI\n  envguard run [options] -- cmd   lance cmd derrière le proxy\n  envguard mcp [options] -- cmd   proxy stdio pour serveur MCP\n\nOptions :\n")
+		fmt.Fprintf(fs.Output(), "Usage :\n  envguard [options]              proxy + TUI\n  envguard run [options] -- cmd   lance cmd derrière le proxy\n  envguard mcp [options] -- cmd   proxy stdio pour serveur MCP\n  envguard protect [options]      sécurise automatiquement tous les serveurs MCP (Cursor, Claude, Trae, JetBrains…)\n  envguard unprotect              restaure les configurations MCP d'origine\n  envguard status                 affiche l'état des serveurs MCP détectés\n\nOptions :\n")
 		fs.PrintDefaults()
 	}
 	fs.Parse(os.Args[1:])

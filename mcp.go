@@ -30,13 +30,24 @@ import (
 //
 // Le journal d'audit est écrit dans <config>/envguard/mcp.log (jamais sur stdout).
 func mcpCmd(args []string) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "protect":
+			return mcpProtectCmd(args[1:])
+		case "unprotect":
+			return mcpUnprotectCmd(args[1:])
+		case "status":
+			return mcpStatusCmd(args[1:])
+		}
+	}
+
 	cfgDir, _ := os.UserConfigDir()
 	o := options{
 		logFile: filepath.Join(cfgDir, "envguard", "mcp.log"),
 	}
 	fs := newFlags("envguard mcp", &o)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage : envguard mcp [options] -- commande [args…]\n\nExemple : envguard mcp -- npx @modelcontextprotocol/server-postgres postgresql://localhost/mydb\n\nOptions :\n")
+		fmt.Fprintf(fs.Output(), "Usage :\n  envguard mcp protect [options]  sécurise tous les serveurs MCP détectés\n  envguard mcp unprotect          restaure les configurations d'origine\n  envguard mcp status             affiche l'état des serveurs MCP\n  envguard mcp [options] -- cmd   lance un serveur MCP sous surveillance stdio\n\nOptions :\n")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
