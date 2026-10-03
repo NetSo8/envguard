@@ -287,9 +287,22 @@ func (v *Vault) RehydrateToolTo(dst, b, args []byte, pol *Policy, onBlock func(k
 	m, meta := v.rehyM, v.meta
 	v.mu.RUnlock()
 	var hosts []string
+	var fileChecked, isFile bool
+	var fileTarget string
 	return m.replaceIf(dst, b, func(k int) bool {
 		if k%2 == 1 {
 			return false // variante base64
+		}
+		if !fileChecked {
+			isFile, fileTarget = detectFilePersistence(args)
+			fileChecked = true
+		}
+		if isFile {
+			ok, bad := pol.decideFile(meta[k], fileTarget)
+			if !ok && onBlock != nil {
+				onBlock(meta[k].kind, bad, string(m.pairs[k].from))
+			}
+			return ok || pol.mode == polWarn
 		}
 		if hosts == nil {
 			hosts = extractHosts(args)

@@ -326,3 +326,53 @@ func BenchmarkHintTo64KB(b *testing.B) {
 		dst = injectHint(dst, body, "/v1/messages")
 	}
 }
+
+func BenchmarkDetectFilePersistence(b *testing.B) {
+	cases := []struct {
+		name string
+		args []byte
+	}{
+		{"clean-local-cmd", []byte(`{"command":"DB_PASSWORD=sk-ant-REDACTED_3c93161e npm test"}`)},
+		{"clean-local-devnull", []byte(`{"command":"DB_PASSWORD=sk-ant-REDACTED_3c93161e npm test > /dev/null 2>&1"}`)},
+		{"file-tool-json", []byte(`{"path":"src/config.ts","content":"const API_KEY = 'sk-ant-REDACTED_3c93161e';"}`)},
+		{"file-shell-redirect", []byte(`{"command":"echo 'sk-ant-REDACTED_3c93161e' > src/config.ts"}`)},
+		{"file-shell-git", []byte(`{"command":"git commit -m 'add secret sk-ant-REDACTED_3c93161e'"}`)},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(c.args)))
+			for b.Loop() {
+				detectFilePersistence(c.args)
+			}
+		})
+	}
+}
+
+func BenchmarkPolicyRehydrateTool(b *testing.B) {
+	v := NewVault("")
+	v.Mask([]byte(key))
+	ph := v.Placeholder("sk-ant-", key)
+	pol, _ := parsePolicy("strict", nil)
+
+	localCmd := []byte(`{"command":"DB_PASSWORD=` + ph + ` npm test"}`)
+	fileTool := []byte(`{"path":"src/config.ts","content":"KEY='` + ph + `'"}`)
+
+	b.Run("local-cmd-allowed", func(b *testing.B) {
+		var dst []byte
+		b.ReportAllocs()
+		b.SetBytes(int64(len(localCmd)))
+		for b.Loop() {
+			dst, _ = v.RehydrateToolTo(dst, localCmd, localCmd, pol, nil)
+		}
+	})
+
+	b.Run("file-tool-blocked", func(b *testing.B) {
+		var dst []byte
+		b.ReportAllocs()
+		b.SetBytes(int64(len(fileTool)))
+		for b.Loop() {
+			dst, _ = v.RehydrateToolTo(dst, fileTool, fileTool, pol, nil)
+		}
+	})
+}

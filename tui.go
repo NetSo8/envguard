@@ -238,8 +238,14 @@ func (m *model) viewLog(rows int) string {
 			fmt.Fprintf(&b, "%s %s %s → %s", lipgloss.NewStyle().Foreground(cWarn).Render("◆ secret"),
 				sMuted.Render(e.Rule), preview(e.Secret), sPh.Render(e.Ph))
 		case e.Kind == evBlocked:
-			fmt.Fprintf(&b, "%s %s vers %s %s", lipgloss.NewStyle().Foreground(cErr).Bold(true).Render("⛔ bloqué"),
-				sPh.Render(e.Ph), e.Path, sMuted.Render("(si légitime : -allow-host "+e.Rule+"="+e.Path+")"))
+			if strings.HasPrefix(e.Path, "file:") {
+				f := strings.TrimPrefix(e.Path, "file:")
+				fmt.Fprintf(&b, "%s %s dans %s %s", lipgloss.NewStyle().Foreground(cErr).Bold(true).Render("⛔ fichier"),
+					sPh.Render(e.Ph), f, sMuted.Render("(si légitime : -allow-host "+e.Rule+"=file)"))
+			} else {
+				fmt.Fprintf(&b, "%s %s vers %s %s", lipgloss.NewStyle().Foreground(cErr).Bold(true).Render("⛔ bloqué"),
+					sPh.Render(e.Ph), e.Path, sMuted.Render("(si légitime : -allow-host "+e.Rule+"="+e.Path+")"))
+			}
 		case e.Kind == evErr:
 			b.WriteString(lipgloss.NewStyle().Foreground(cErr).Render("✕ "+e.Path+" : ") + e.Rule)
 		}

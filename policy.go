@@ -40,8 +40,9 @@ const (
 )
 
 type Policy struct {
-	mode  policyMode
-	extra map[string][]string // type de secret (« env:DB_PASSWORD », « env », « generic », « * ») -> hôtes
+	mode   policyMode
+	extra  map[string][]string // type de secret (« env:DB_PASSWORD », « env », « generic », « * ») -> hôtes
+	noFile bool                // désactiver la protection contre l'écriture de fichiers
 }
 
 // Destinations légitimes par type de règle.
@@ -104,6 +105,20 @@ func (p *Policy) decide(m *secretMeta, hosts []string) (bool, string) {
 		return false, h
 	}
 	return true, ""
+}
+
+// decideFile : le secret m peut-il être écrit dans le fichier/cible target ?
+// Renvoie ok, et en cas de refus le nom de la cible bloquée.
+func (p *Policy) decideFile(m *secretMeta, target string) (bool, string) {
+	if !p.active() || p.noFile || m == nil {
+		return true, ""
+	}
+	family, _, _ := strings.Cut(m.kind, ":")
+	if hostIn("file", p.extra[m.kind]) || hostIn("file", p.extra[family]) || hostIn("file", p.extra["*"]) ||
+		hostIn(target, p.extra[m.kind]) || hostIn(target, p.extra[family]) || hostIn(target, p.extra["*"]) {
+		return true, ""
+	}
+	return false, target
 }
 
 // --- extraction des hôtes ---------------------------------------------------
@@ -197,12 +212,13 @@ func extractHosts(b []byte) []string {
 		if dot := strings.LastIndexByte(tok, '.'); dot > 0 {
 			tld := strings.ToLower(tok[dot+1:])
 			followedByCall := j < len(b) && b[j] == '('
+			isEnv := i > 0 && b[i-1] == '.' && strings.HasPrefix(tok, "env.")
 			switch {
 			case after:
 				add(tok)
 			case isIPv4(tok):
 				add(tok)
-			case !followedByCall && isTLD(tld) && len(tok) >= 4:
+			case !followedByCall && !isEnv && isTLD(tld) && len(tok) >= 4:
 				add(tok)
 			}
 		} else if after && len(tok) > 0 {
@@ -263,4 +279,420 @@ func walkTools(b []byte, i, depth int, dst []int) []int {
 		})
 	}
 	return dst
+}
+
+// --- protection contre l'écriture de secrets dans les fichiers (Filesystem Leak Guard) ---
+
+var pathKeys = [...]string{
+	"path", "file_path", "filePath", "target_file", "TargetFile", "filename", "file_name", "destination", "dest", "file",
+}
+
+var fileContentKeys = [...]string{
+	"content", "contents", "CodeContent", "new_str", "new_string", "replacement",
+	"ReplacementContent", "replacement_text", "patch", "diff", "file_text", "insert_line", "edits",
+}
+
+var cmdKeys = [...]string{"command", "cmd", "script"}
+
+// detectFilePersistence inspecte les arguments d'un appel d'outil (args) pour
+// déterminer si l'appel persiste des données dans un fichier ou dans l'historique
+// Git (au lieu d'une simple exécution éphémère de commande locale).
+//
+// Renvoie true et la cible identifiée (ex. "file:src/config.ts", "file:git-commit")
+// si une écriture de fichier est détectée, sinon false, "".
+// Zéro allocation sur le chemin négatif.
+func detectFilePersistence(args []byte) (bool, string) {
+	if len(args) == 0 {
+		return false, ""
+	}
+
+	// 1. Outils structurés d'édition / création de fichiers (JSON).
+	// Présence simultanée d'une clé de chemin ET d'une clé de contenu / modification.
+	if path, ok := findFilePath(args); ok {
+		if hasFileContentKey(args) {
+			// Les fichiers .env réels (.env, .env.local, .env.production...) sont la destination
+			// légitime des secrets : leur écriture est autorisée. Les fichiers d'exemple
+			// (.env.example, .env.sample...) restent protégés.
+			if isDotEnvFile(path) {
+				return false, ""
+			}
+			if len(path) > 0 {
+				return true, "file:" + string(path)
+			}
+			return true, "file"
+		}
+	}
+
+	// 2. Commandes shell : redirection vers fichier (> ou >>), pipe vers tee, ou git commit.
+	cmd := extractCommandField(args)
+	if isFile, target := detectShellPersistence(cmd); isFile {
+		return true, target
+	}
+
+	return false, ""
+}
+
+func findFilePath(b []byte) ([]byte, bool) {
+	for _, k := range pathKeys {
+		if val, ok := findJSONKeyVal(b, k); ok && len(val) > 0 {
+			val = cleanPathVal(val)
+			if len(val) > 0 {
+				return val, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func hasFileContentKey(b []byte) bool {
+	for _, k := range fileContentKeys {
+		if _, ok := findJSONKeyVal(b, k); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanPathVal(val []byte) []byte {
+	val = bytes.TrimSpace(val)
+	if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') && val[len(val)-1] == val[0] {
+		val = val[1 : len(val)-1]
+	}
+	if bytes.Contains(val, []byte("://")) {
+		return nil
+	}
+	return val
+}
+
+func extractCommandField(args []byte) []byte {
+	for _, k := range cmdKeys {
+		if val, ok := findJSONKeyVal(args, k); ok && len(val) > 0 {
+			return val
+		}
+	}
+	return args
+}
+
+func detectShellPersistence(cmd []byte) (bool, string) {
+	if len(cmd) == 0 {
+		return false, ""
+	}
+	if hasGitCommit(cmd) {
+		return true, "file:git-commit"
+	}
+	if target, ok := findTeeTarget(cmd); ok {
+		if isDotEnvFile(target) {
+			return false, ""
+		}
+		if len(target) > 0 {
+			return true, "file:" + string(target)
+		}
+		return true, "file:tee"
+	}
+	if target, ok := findRedirectionTarget(cmd); ok {
+		if isDotEnvFile(target) {
+			return false, ""
+		}
+		if len(target) > 0 {
+			return true, "file:" + string(target)
+		}
+		return true, "file"
+	}
+	return false, ""
+}
+
+// isDotEnvFile vérifie si le chemin correspond à un vrai fichier .env (.env, .env.local, .env.production...).
+// Les fichiers modèles (.env.example, .env.sample, etc.) ne sont pas considérés comme légitimes
+// car ils sont destinés à être commités dans Git.
+func isDotEnvFile(path []byte) bool {
+	base := path
+	if idx := bytes.LastIndexByte(path, '/'); idx >= 0 {
+		base = path[idx+1:]
+	}
+	if idx := bytes.LastIndexByte(base, '\\'); idx >= 0 {
+		base = base[idx+1:]
+	}
+	if len(base) == 0 {
+		return false
+	}
+	isEnv := bytes.Equal(base, []byte(".env")) || bytes.Equal(base, []byte(".envrc")) ||
+		bytes.HasPrefix(base, []byte(".env."))
+	if !isEnv {
+		return false
+	}
+	// Éliminer les fichiers d'exemple / template (ex: .env.example, .env.sample...)
+	low := bytes.ToLower(base)
+	if bytes.Contains(low, []byte("example")) || bytes.Contains(low, []byte("sample")) ||
+		bytes.Contains(low, []byte("template")) || bytes.HasSuffix(low, []byte(".dist")) ||
+		bytes.HasSuffix(low, []byte(".schema")) {
+		return false
+	}
+	return true
+}
+
+func hasGitCommit(cmd []byte) bool {
+	for i := 0; i+3 <= len(cmd); {
+		idx := bytes.Index(cmd[i:], []byte("git"))
+		if idx < 0 {
+			break
+		}
+		p := i + idx
+		beforeOK := p == 0 || isShellSep(cmd[p-1])
+		afterOK := p+3 < len(cmd) && (cmd[p+3] == ' ' || cmd[p+3] == '\t' || cmd[p+3] == '\n' || cmd[p+3] == '\\')
+		if beforeOK && afterOK {
+			rem := cmd[p+3:]
+			if len(rem) > 80 {
+				rem = rem[:80]
+			}
+			cidx := bytes.Index(rem, []byte("commit"))
+			if cidx >= 0 {
+				cp := cidx
+				cBeforeOK := cp == 0 || isShellSep(rem[cp-1])
+				cAfterOK := cp+6 >= len(rem) || isShellSep(rem[cp+6])
+				if cBeforeOK && cAfterOK {
+					return true
+				}
+			}
+		}
+		i = p + 3
+	}
+	return false
+}
+
+func findTeeTarget(cmd []byte) ([]byte, bool) {
+	for i := 0; i+3 <= len(cmd); {
+		idx := bytes.Index(cmd[i:], []byte("tee"))
+		if idx < 0 {
+			break
+		}
+		p := i + idx
+		beforeOK := p == 0 || isShellSep(cmd[p-1]) || cmd[p-1] == '|'
+		afterOK := p+3 < len(cmd) && (cmd[p+3] == ' ' || cmd[p+3] == '\t')
+		if beforeOK && afterOK {
+			rem := skipShellWS(cmd[p+3:])
+			for len(rem) > 0 && rem[0] == '-' {
+				rem = skipShellToken(rem)
+				rem = skipShellWS(rem)
+			}
+			if len(rem) > 0 {
+				target := readFilename(rem)
+				if isRealFilename(target) {
+					return target, true
+				}
+			}
+		}
+		i = p + 3
+	}
+	return nil, false
+}
+
+func findRedirectionTarget(cmd []byte) ([]byte, bool) {
+	for i := 0; i < len(cmd); i++ {
+		if cmd[i] != '>' {
+			continue
+		}
+		p := i + 1
+		if p < len(cmd) && cmd[p] == '>' {
+			p++
+		}
+		rem := skipShellWS(cmd[p:])
+		if len(rem) == 0 {
+			continue
+		}
+		if rem[0] == '&' {
+			continue
+		}
+		target := readFilename(rem)
+		if len(target) == 0 {
+			continue
+		}
+		if bytes.Equal(target, []byte("/dev/null")) || bytes.Equal(target, []byte("/dev/zero")) ||
+			bytes.Equal(target, []byte("/dev/stdout")) || bytes.Equal(target, []byte("/dev/stderr")) {
+			continue
+		}
+		if isRealFilename(target) {
+			return target, true
+		}
+	}
+	return nil, false
+}
+
+func readFilename(rem []byte) []byte {
+	if len(rem) >= 2 && rem[0] == '\\' && rem[1] == '"' {
+		idx := bytes.Index(rem[2:], []byte(`\"`))
+		if idx >= 0 {
+			return rem[2 : 2+idx]
+		}
+		return rem[2:]
+	}
+	if len(rem) > 1 && (rem[0] == '"' || rem[0] == '\'') {
+		q := rem[0]
+		end := bytes.IndexByte(rem[1:], q)
+		if end >= 0 {
+			return rem[1 : 1+end]
+		}
+		return rem[1:]
+	}
+	for i := 0; i < len(rem); i++ {
+		c := rem[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '|' || c == ';' || c == '&' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '\\' {
+			return rem[:i]
+		}
+	}
+	return rem
+}
+
+func isRealFilename(target []byte) bool {
+	if len(target) == 0 {
+		return false
+	}
+	hasPathChar := false
+	allDigits := true
+	for i := 0; i < len(target); i++ {
+		c := target[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == '/' || c == '_' || c == '-' {
+			hasPathChar = true
+		}
+		if c < '0' || c > '9' {
+			allDigits = false
+		}
+	}
+	return hasPathChar && !allDigits
+}
+
+func skipShellWS(b []byte) []byte {
+	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t' || b[0] == '\r' || b[0] == '\n') {
+		b = b[1:]
+	}
+	return b
+}
+
+func skipShellToken(b []byte) []byte {
+	for len(b) > 0 && b[0] != ' ' && b[0] != '\t' && b[0] != '\r' && b[0] != '\n' && b[0] != '|' && b[0] != ';' {
+		b = b[1:]
+	}
+	return b
+}
+
+func isShellSep(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ';' || c == '|' || c == '&' || c == '(' || c == ')' || c == '{' || c == '}' || c == '`' || c == '"' || c == '\''
+}
+
+func skipShellWSReverse(b []byte) []byte {
+	for len(b) > 0 {
+		c := b[len(b)-1]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			b = b[:len(b)-1]
+		} else {
+			break
+		}
+	}
+	return b
+}
+
+func findJSONKeyVal(b []byte, key string) ([]byte, bool) {
+	kb := []byte(key)
+	klen := len(kb)
+	for i := 0; i+klen <= len(b); {
+		idx := bytes.Index(b[i:], kb)
+		if idx < 0 {
+			return nil, false
+		}
+		p := i + idx
+		var keyStart, keyEnd int
+		isEscaped := false
+		if p >= 2 && b[p-2] == '\\' && b[p-1] == '"' {
+			isEscaped = true
+			keyStart = p - 2
+		} else if p >= 1 && b[p-1] == '"' {
+			keyStart = p - 1
+		} else {
+			i = p + klen
+			continue
+		}
+
+		if isEscaped {
+			if p+klen+1 >= len(b) || b[p+klen] != '\\' || b[p+klen+1] != '"' {
+				i = p + klen
+				continue
+			}
+			keyEnd = p + klen + 2
+		} else {
+			if p+klen >= len(b) || b[p+klen] != '"' {
+				i = p + klen
+				continue
+			}
+			keyEnd = p + klen + 1
+		}
+
+		before := skipShellWSReverse(b[:keyStart])
+		if len(before) > 0 {
+			last := before[len(before)-1]
+			if last != '{' && last != ',' && last != '"' {
+				i = p + klen
+				continue
+			}
+		}
+
+		rem := b[keyEnd:]
+		for len(rem) > 0 && (rem[0] == ' ' || rem[0] == '\t' || rem[0] == '\n' || rem[0] == '\r') {
+			rem = rem[1:]
+		}
+		if len(rem) == 0 || rem[0] != ':' {
+			i = p + klen
+			continue
+		}
+		rem = rem[1:] // saute ':'
+		for len(rem) > 0 && (rem[0] == ' ' || rem[0] == '\t' || rem[0] == '\n' || rem[0] == '\r') {
+			rem = rem[1:]
+		}
+		if len(rem) == 0 {
+			return nil, false
+		}
+
+		if len(rem) >= 2 && rem[0] == '\\' && rem[1] == '"' {
+			valStart := 2
+			valEnd := -1
+			for j := valStart; j+1 < len(rem); j++ {
+				if rem[j] == '\\' && rem[j+1] == '"' {
+					bs := 0
+					for k := j - 1; k >= valStart && rem[k] == '\\'; k-- {
+						bs++
+					}
+					if bs%2 == 0 {
+						valEnd = j
+						break
+					}
+				}
+			}
+			if valEnd >= valStart {
+				return rem[valStart:valEnd], true
+			}
+			return nil, false
+		} else if rem[0] == '"' {
+			valStart := 1
+			valEnd := -1
+			for j := valStart; j < len(rem); j++ {
+				if rem[j] == '"' {
+					bs := 0
+					for k := j - 1; k >= valStart && rem[k] == '\\'; k-- {
+						bs++
+					}
+					if bs%2 == 0 {
+						valEnd = j
+						break
+					}
+				}
+			}
+			if valEnd >= valStart {
+				return rem[valStart:valEnd], true
+			}
+			return nil, false
+		} else if rem[0] == '{' || rem[0] == '[' {
+			return rem[:1], true
+		}
+
+		i = p + klen
+	}
+	return nil, false
 }

@@ -27,12 +27,13 @@ type options struct {
 	maxBody    int64
 	origins    originsFlag
 	envFiles   listFlag
-	noEnv      bool
-	toolPolicy string
-	allowHosts listFlag
-	logFile    string // run : journal (l'outil lancé occupe le terminal)
-	noGL       bool
-	glExclude  listFlag
+	noEnv       bool
+	toolPolicy  string
+	allowHosts  listFlag
+	noFileGuard bool
+	logFile     string // run : journal (l'outil lancé occupe le terminal)
+	noGL        bool
+	glExclude   listFlag
 }
 
 func newFlags(name string, o *options) *flag.FlagSet {
@@ -52,6 +53,7 @@ func newFlags(name string, o *options) *flag.FlagSet {
 	fs.BoolVar(&o.noEnv, "no-env", false, "ne pas lire les fichiers .env du dossier courant")
 	fs.StringVar(&o.toolPolicy, "tool-policy", "strict", "réhydratation dans les appels d'outils : strict, warn ou off")
 	fs.Var(&o.allowHosts, "allow-host", "destination autorisée pour un type de secret : type=hôte, ex. env:API_TOKEN=api.exemple.com (répétable)")
+	fs.BoolVar(&o.noFileGuard, "no-file-guard", false, "désactiver la protection contre l'écriture de secrets dans les fichiers")
 	fs.BoolVar(&o.noGL, "no-gitleaks", false, "désactiver les règles gitleaks")
 	fs.Var(&o.glExclude, "gitleaks-exclude", "règle gitleaks à ignorer, ex. twilio-api-key (répétable ; generic-api-key et jwt le sont toujours)")
 	fs.StringVar(&o.logFile, "log", filepath.Join(cfgDir, "envguard", "run.log"), "journal de « envguard run »")
@@ -68,6 +70,7 @@ func setup(o *options) (*Proxy, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	pol.noFile = o.noFileGuard
 	key, err := LoadKey(o.keyFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("clé %s : %v", o.keyFile, err)
@@ -133,7 +136,12 @@ func logEvent(w io.Writer, e Event) {
 	case evSecret:
 		fmt.Fprintf(w, "%s secret %s → %s\n", ts, e.Rule, e.Ph)
 	case evBlocked:
-		fmt.Fprintf(w, "%s RÉHYDRATATION BLOQUÉE %s vers %s (si légitime : -allow-host %s=%s)\n", ts, e.Ph, e.Path, e.Rule, e.Path)
+		if strings.HasPrefix(e.Path, "file:") {
+			f := strings.TrimPrefix(e.Path, "file:")
+			fmt.Fprintf(w, "%s RÉHYDRATATION BLOQUÉE %s dans %s (écriture de fichier protégée ; si légitime : -allow-host %s=file)\n", ts, e.Ph, f, e.Rule)
+		} else {
+			fmt.Fprintf(w, "%s RÉHYDRATATION BLOQUÉE %s vers %s (si légitime : -allow-host %s=%s)\n", ts, e.Ph, e.Path, e.Rule, e.Path)
+		}
 	case evErr:
 		fmt.Fprintf(w, "%s erreur %s : %s\n", ts, e.Path, e.Rule)
 	}

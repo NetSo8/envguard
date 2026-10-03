@@ -135,6 +135,7 @@ Le type d'un secret apparaît dans la TUI : `env:NOM`, `generic`, `url_password`
 
 - **Retenue en streaming :** dès qu'un placeholder apparaît dans des arguments, la suite de l'appel est retenue jusqu'à sa fin, car le domaine visé peut arriver après le placeholder.
 - **Variantes base64 :** un placeholder encodé en base64 n'est jamais réhydraté dans un appel d'outil.
+- **Protection des fichiers (Filesystem Leak Guard) :** si un appel d'outil tente d'écrire un secret dans un fichier (`write_to_file`, `str_replace_editor`, champs `path` + `content`, redirections shell `> fichier`, `>> fichier`, `tee`, ou `git commit`), la réhydratation est bloquée pour éviter d'inscrire le secret en clair dans le code source ou l'historique Git. Les commandes éphémères (`DB_PASSWORD=… npm test`, redirections `> /dev/null 2>&1`) restent autorisées. Pour autoriser l'écriture : `-allow-host type=file` ou `-no-file-guard`.
 - **Limite :** c'est une défense contre les exfiltrations visibles. Une commande qui reconstruit l'hôte à l'exécution (`$(echo … | base64 -d)`) n'est pas détectable ici.
 
 `-tool-policy warn` remet le secret mais signale l'appel ; `-tool-policy off` revient à l'ancien comportement.
@@ -183,7 +184,8 @@ Toutes les options s'appliquent à `envguard` comme à `envguard run`.
 | `-env-file fichier` | les `.env*` du dossier courant | fichier `.env` dont les valeurs sont masquées (répétable) |
 | `-no-env` | `false` | ne pas lire les `.env` du dossier courant |
 | `-tool-policy` | `strict` | réhydratation dans les appels d'outils : `strict`, `warn` ou `off` |
-| `-allow-host type=hôte` | — | destination autorisée pour un type de secret (répétable), ex. `env:API_TOKEN=api.exemple.com` |
+| `-no-file-guard` | `false` | ne pas bloquer l'écriture de secrets dans les fichiers |
+| `-allow-host type=hôte` | — | destination autorisée pour un type de secret (répétable), ex. `env:API_TOKEN=api.exemple.com` (ou `type=file`) |
 | `-no-gitleaks` | `false` | désactiver les règles gitleaks |
 | `-gitleaks-exclude id` | — | ignorer une règle gitleaks (répétable) |
 | `-allow` | `~/.envguard_allow` | allowlist (envguard n'y écrit que des HMAC, jamais le secret en clair) |

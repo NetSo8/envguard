@@ -215,3 +215,199 @@ func TestPolicyLocalCommand(t *testing.T) {
 }
 
 func b64enc(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+
+// --- Tests Filesystem Leak Guard --------------------------------------------
+
+func TestDetectFilePersistence(t *testing.T) {
+	cases := []struct {
+		in     string
+		wantOK bool
+		wantTg string
+	}{
+		// 1. Outils structurés (écriture / édition de fichiers de code : bloqué)
+		{`{"path": "src/config.ts", "content": "const k = 'SECRET';" }`, true, "file:src/config.ts"},
+		{`{"file_path": "lib/db.go", "new_str": "password = 'SECRET'" }`, true, "file:lib/db.go"},
+		{`{"target_file": "src/auth.ts", "replacement": "SECRET = 'foo'" }`, true, "file:src/auth.ts"},
+		{`{"filename": "main.go", "patch": "diff --git..." }`, true, "file:main.go"},
+		{`{"path": "src/app.py", "old_str": "a", "new_str": "b" }`, true, "file:src/app.py"},
+		{`{"destination": "config.json", "CodeContent": "{}" }`, true, "file:config.json"},
+		{`"{\"path\": \"src/config.ts\", \"content\": \"SECRET\"}"`, true, "file:src/config.ts"},
+		{`{"path": ".env.example", "content": "KEY=SECRET" }`, true, "file:.env.example"},
+		{`{"path": ".env.sample", "content": "KEY=SECRET" }`, true, "file:.env.sample"},
+
+		// 2. Fichiers .env légitimes (destination autorisée pour les secrets !)
+		{`{"filePath": ".env.production", "contents": "KEY=SECRET\n" }`, false, ""},
+		{`{"path": ".env", "content": "KEY=SECRET\n" }`, false, ""},
+		{`{"path": ".env.local", "content": "KEY=SECRET\n" }`, false, ""},
+		{`{"command": "echo 'SECRET' >> .env"}`, false, ""},
+		{`{"command": "echo 'SECRET' | tee -a .env.local"}`, false, ""},
+
+		// 3. Commandes shell persistantes sur fichiers de code ou commits
+		{`{"command": "echo 'SECRET' > src/config.ts"}`, true, "file:src/config.ts"},
+		{`{"command": "echo 'SECRET' >> .env.example"}`, true, "file:.env.example"},
+		{`{"command": "cat << 'EOF' > /tmp/keys.txt\nSECRET\nEOF"}`, true, "file:/tmp/keys.txt"},
+		{`{"command": "echo 'SECRET' | tee src/secrets.json"}`, true, "file:src/secrets.json"},
+		{`{"command": "git commit -m 'add api key SECRET'"}`, true, "file:git-commit"},
+		{`{"command": "git commit -am 'update tokens'"}`, true, "file:git-commit"},
+		{`{"cmd": "echo 'SECRET' > \"src/my file.ts\""}`, true, "file:src/my file.ts"},
+
+		// 4. Commandes éphémères légitimes (doivent être autorisées, wantOK=false)
+		{`{"command": "DB_PASSWORD=SECRET npm test"}`, false, ""},
+		{`{"command": "go test ./..."}`, false, ""},
+		{`{"command": "pytest -v -k test_auth"}`, false, ""},
+		{`{"command": "python app.py --key=SECRET"}`, false, ""},
+		{`{"command": "DB_PASSWORD=SECRET npm test > /dev/null 2>&1"}`, false, ""},
+		{`{"command": "awk '$1 > 2' data.txt"}`, false, ""},
+		{`{"command": "python -c 'if x > 5: print(1)'"}`, false, ""},
+		{`{"command": "curl http://localhost:3000/api -H 'Authorization: Bearer SECRET'"}`, false, ""},
+		{`{"command": "grep -rn 'SECRET' ."}`, false, ""},
+
+		// 5. Outils en lecture seule (pas de clé de contenu)
+		{`{"path": "src/config.ts"}`, false, ""},
+		{`{"path": "src/config.ts", "offset": 10, "limit": 50}`, false, ""},
+		{`{"file_path": "README.md"}`, false, ""},
+	}
+
+	for _, c := range cases {
+		ok, target := detectFilePersistence([]byte(c.in))
+		if ok != c.wantOK || target != c.wantTg {
+			t.Errorf("detectFilePersistence(%s)\n  obtenu (%v, %q), attendu (%v, %q)",
+				c.in, ok, target, c.wantOK, c.wantTg)
+		}
+	}
+}
+
+// Vérifie que l'écriture d'un placeholder dans un fichier est bloquée en mode strict.
+func TestPolicyFilePersistenceStrict(t *testing.T) {
+	v, ph := policyVault(t)
+	pol, _ := parsePolicy("strict", nil)
+	var blocked []string
+	onBlock := func(kind, host, p string) { blocked = append(blocked, kind+"→"+host) }
+
+	resp := func(path, content string) []byte {
+		b, _ := json.Marshal(map[string]any{"content": []any{
+			map[string]any{"type": "text", "text": "Voici ta clé : " + ph},
+			map[string]any{"type": "tool_use", "id": "t1", "name": "write_to_file", "input": map[string]any{
+				"path": path, "content": content,
+			}},
+		}})
+		return b
+	}
+
+	// Tentative d'écriture dans un fichier source
+	out, _ := v.RehydrateDocTo(nil, resp("src/config.ts", "export const KEY = '"+ph+"';"), 0, pol, onBlock)
+	// Le texte utilisateur doit être réhydraté (1), mais l'appel d'outil doit garder le placeholder
+	if bytes.Count(out, []byte(key)) != 1 || !bytes.Contains(out, []byte(ph)) {
+		t.Fatalf("le secret ne devait pas être écrit dans le fichier :\n%s", out)
+	}
+	if len(blocked) != 1 || blocked[0] != "anthropic→file:src/config.ts" {
+		t.Fatalf("blocage attendu sur file:src/config.ts, obtenu : %v", blocked)
+	}
+
+	// Écriture dans un fichier .env légitime : doit être AUTORISÉE !
+	blocked = nil
+	out, _ = v.RehydrateDocTo(nil, resp(".env", "API_KEY="+ph+"\n"), 0, pol, onBlock)
+	if bytes.Count(out, []byte(key)) != 2 || len(blocked) != 0 {
+		t.Fatalf("l'écriture dans .env devait être autorisée :\n%s (bloqués: %v)", out, blocked)
+	}
+
+	// Écriture dans un fichier .env.local légitime : doit être AUTORISÉE !
+	blocked = nil
+	out, _ = v.RehydrateDocTo(nil, resp(".env.local", "API_KEY="+ph+"\n"), 0, pol, onBlock)
+	if bytes.Count(out, []byte(key)) != 2 || len(blocked) != 0 {
+		t.Fatalf("l'écriture dans .env.local devait être autorisée :\n%s (bloqués: %v)", out, blocked)
+	}
+
+	// Écriture dans un .env.example (modèle destiné à Git) : doit être BLOQUÉE !
+	blocked = nil
+	out, _ = v.RehydrateDocTo(nil, resp(".env.example", "API_KEY="+ph+"\n"), 0, pol, onBlock)
+	if bytes.Count(out, []byte(key)) != 1 || len(blocked) != 1 || blocked[0] != "anthropic→file:.env.example" {
+		t.Fatalf("l'écriture dans .env.example devait être bloquée :\n%s (bloqués: %v)", out, blocked)
+	}
+}
+
+// Vérifie que les redirections shell vers un fichier et git commit sont bloqués.
+func TestPolicyFilePersistenceShell(t *testing.T) {
+	v, ph := policyVault(t)
+	pol, _ := parsePolicy("strict", nil)
+
+	// 1. Redirection >
+	var blocked []string
+	onBlock := func(kind, host, p string) { blocked = append(blocked, kind+"→"+host) }
+	args1 := []byte(`{"command": "echo '` + ph + `' > src/config.ts"}`)
+	out, _ := v.RehydrateToolTo(nil, args1, args1, pol, onBlock)
+	if bytes.Contains(out, []byte(key)) || !bytes.Contains(out, []byte(ph)) || len(blocked) != 1 || blocked[0] != "anthropic→file:src/config.ts" {
+		t.Fatalf("redirection non bloquée : out=%s, blocked=%v", out, blocked)
+	}
+
+	// 2. Git commit
+	blocked = nil
+	args2 := []byte(`{"command": "git commit -m 'add key ` + ph + `'"}`)
+	out, _ = v.RehydrateToolTo(nil, args2, args2, pol, onBlock)
+	if bytes.Contains(out, []byte(key)) || !bytes.Contains(out, []byte(ph)) || len(blocked) != 1 || blocked[0] != "anthropic→file:git-commit" {
+		t.Fatalf("git commit non bloqué : out=%s, blocked=%v", out, blocked)
+	}
+
+	// 3. Commande locale avec > /dev/null 2>&1 (doit passer !)
+	blocked = nil
+	args3 := []byte(`{"command": "KEY=` + ph + ` npm test > /dev/null 2>&1"}`)
+	out, _ = v.RehydrateToolTo(nil, args3, args3, pol, onBlock)
+	if !bytes.Contains(out, []byte(key)) || len(blocked) != 0 {
+		t.Fatalf("commande locale avec /dev/null indûment bloquée : out=%s, blocked=%v", out, blocked)
+	}
+}
+
+// Vérifie les modes warn, allow-host et no-file-guard.
+func TestPolicyFilePersistenceModes(t *testing.T) {
+	v, ph := policyVault(t)
+	args := []byte(`{"path": "src/config.ts", "content": "KEY='` + ph + `'"}`)
+
+	// Mode warn : réhydraté, mais signalé
+	polWarn, _ := parsePolicy("warn", nil)
+	var blockedWarn []string
+	out, _ := v.RehydrateToolTo(nil, args, args, polWarn, func(k, h, p string) { blockedWarn = append(blockedWarn, k+"→"+h) })
+	if !bytes.Contains(out, []byte(key)) || len(blockedWarn) != 1 {
+		t.Fatalf("mode warn échoué : out=%s, blocked=%v", out, blockedWarn)
+	}
+
+	// Mode allow-host anthropic=file : autorisé
+	polAllowFile, _ := parsePolicy("strict", []string{"anthropic=file"})
+	var blockedAllow []string
+	out, _ = v.RehydrateToolTo(nil, args, args, polAllowFile, func(k, h, p string) { blockedAllow = append(blockedAllow, k+"→"+h) })
+	if !bytes.Contains(out, []byte(key)) || len(blockedAllow) != 0 {
+		t.Fatalf("allow-host=file échoué : out=%s, blocked=%v", out, blockedAllow)
+	}
+
+	// Mode no-file-guard : autorisé
+	polNoFile, _ := parsePolicy("strict", nil)
+	polNoFile.noFile = true
+	var blockedNoFile []string
+	out, _ = v.RehydrateToolTo(nil, args, args, polNoFile, func(k, h, p string) { blockedNoFile = append(blockedNoFile, k+"→"+h) })
+	if !bytes.Contains(out, []byte(key)) || len(blockedNoFile) != 0 {
+		t.Fatalf("noFile échoué : out=%s, blocked=%v", out, blockedNoFile)
+	}
+}
+
+// Streaming Anthropic : écriture de fichier en tool_use streaming bloquée.
+func TestPolicySSEFilePersistence(t *testing.T) {
+	v, ph := policyVault(t)
+	pol, _ := parsePolicy("strict", nil)
+	args := `{"path":"src/config.ts","content":"const API_KEY = '` + ph + `';"}`
+
+	var src bytes.Buffer
+	for _, part := range []string{args[:25], args[25:]} {
+		d, _ := json.Marshal(deltaEvent{Type: "content_block_delta", Index: 1, Delta: delta{Type: "input_json_delta", PartialJSON: part}})
+		src.WriteString("event: content_block_delta\ndata: " + string(d) + "\n\n")
+	}
+	src.WriteString("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n")
+
+	var out bytes.Buffer
+	nb := 0
+	(&sseRewriter{v: v, w: &out, pol: pol, onBlock: func(k, h, p string) { nb++ }}).run(&src)
+	got := collect(t, out.String())
+
+	// Le placeholder doit être resté intact dans le fichier
+	if strings.Contains(got, key) || !strings.Contains(got, ph) || nb != 1 {
+		t.Fatalf("persistance SSE non bloquée : got=%q, nbBloqués=%d", got, nb)
+	}
+}

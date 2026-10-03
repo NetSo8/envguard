@@ -105,6 +105,7 @@ func FuzzToolSpans(f *testing.F) {
 			}
 		}
 		extractHosts(b)
+		detectFilePersistence(b)
 	})
 }
 

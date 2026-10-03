@@ -99,7 +99,12 @@ func runCmd(args []string) int {
 			case evBlocked:
 				nBlocked++
 				if len(blocked) < 5 {
-					blocked = append(blocked, fmt.Sprintf("%s vers %s (si légitime : -allow-host %s=%s)", e.Ph, e.Path, e.Rule, e.Path))
+					if strings.HasPrefix(e.Path, "file:") {
+						f := strings.TrimPrefix(e.Path, "file:")
+						blocked = append(blocked, fmt.Sprintf("%s dans %s (écriture de fichier protégée ; si légitime : -allow-host %s=file)", e.Ph, f, e.Rule))
+					} else {
+						blocked = append(blocked, fmt.Sprintf("%s vers %s (si légitime : -allow-host %s=%s)", e.Ph, e.Path, e.Rule, e.Path))
+					}
 				}
 			}
 			mu.Unlock()
